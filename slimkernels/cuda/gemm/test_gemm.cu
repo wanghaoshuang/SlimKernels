@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas.h>
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -7,29 +8,6 @@
 #include <fstream>
 #include <cstring>
 #include <tuple>
-
-// 简单的GEMM kernel实现
-__global__ void gemm_kernel(
-    const float* A, 
-    const float* B, 
-    float* C, 
-    const int M, 
-    const int N, 
-    const int K,
-    const float alpha,
-    const float beta
-) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int k = 0; k < K; ++k) {
-            sum += A[row * K + k] * B[k * N + col];
-        }
-        C[row * N + col] = alpha * sum + beta * C[row * N + col];
-    }
-}
 
 // 优化的GEMM kernel (使用共享内存)
 __global__ void gemm_optimized_kernel(
@@ -94,6 +72,18 @@ __global__ void gemm_optimized_kernel(
         } \
     } while(0)
 
+// cuBLAS错误检查宏 (老版本API)
+#define CUBLAS_CHECK(call) \
+    do { \
+        call; \
+        cudaError_t err = cudaGetLastError(); \
+        if (err != cudaSuccess) { \
+            std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ << " - " \
+                      << cudaGetErrorString(err) << std::endl; \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
 // 生成随机数据
 void generate_random_data(float* data, int size, float min_val = -1.0f, float max_val = 1.0f) {
     std::random_device rd;
@@ -105,6 +95,24 @@ void generate_random_data(float* data, int size, float min_val = -1.0f, float ma
     }
 }
 
+
+
+// cuBLAS GEMM实现 (老版本API)
+void cublas_gemm(
+    const float* A, 
+    const float* B, 
+    float* C, 
+    const int M, 
+    const int N, 
+    const int K,
+    const float alpha,
+    const float beta
+) {
+    // 老版本cuBLAS API
+    // sgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+    // 其中: 'N'表示不转置, 'T'表示转置
+    CUBLAS_CHECK(cublasSgemm('N', 'N', M, N, K, alpha, A, M, B, K, beta, C, M));
+}
 
 // 性能测试函数
 void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
@@ -142,36 +150,58 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     float beta = 0.0f;
     
     // 预热
-    for (int i = 0; i < 10; ++i) {
-        gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // for (int i = 0; i < 10; ++i) {
+    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+    // }
+    // CUDA_CHECK(cudaDeviceSynchronize());
     
     // 测试基础kernel性能
+    // auto start = std::chrono::high_resolution_clock::now();
+    // for (int i = 0; i < num_runs; ++i) {
+    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+    // }
+    // CUDA_CHECK(cudaDeviceSynchronize());
+    // auto end = std::chrono::high_resolution_clock::now();
+    
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // double avg_time_ms = duration.count() / 1000.0 / num_runs;
+    
+    // // 计算理论性能
+    // double flops = 2.0 * M * N * K;
+    // double gflops = (flops / avg_time_ms) / 1e6;
+    
+    // std::cout << "Basic GEMM Kernel:" << std::endl;
+    // std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
+    // std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
+    
+    // 测试优化kernel性能
+    CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
+    
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_runs; ++i) {
-        gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+        gemm_optimized_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
     
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     double avg_time_ms = duration.count() / 1000.0 / num_runs;
-    
+
     // 计算理论性能
     double flops = 2.0 * M * N * K;
     double gflops = (flops / avg_time_ms) / 1e6;
     
-    std::cout << "Basic GEMM Kernel:" << std::endl;
+    std::cout << "Optimized GEMM Kernel:" << std::endl;
     std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
     std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
     
-    // 测试优化kernel性能
+    
+    // 测试cuBLAS性能
     CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
     
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_runs; ++i) {
-        gemm_optimized_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+        cublas_gemm(d_A, d_B, d_C, M, N, K, alpha, beta);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     end = std::chrono::high_resolution_clock::now();
@@ -180,7 +210,7 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     avg_time_ms = duration.count() / 1000.0 / num_runs;
     gflops = (flops / avg_time_ms) / 1e6;
     
-    std::cout << "Optimized GEMM Kernel:" << std::endl;
+    std::cout << "cuBLAS GEMM:" << std::endl;
     std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
     std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
     

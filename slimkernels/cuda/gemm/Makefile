@@ -1,5 +1,5 @@
 NVCC = nvcc
-NVCC_FLAGS = -std=c++17 -O3
+NVCC_FLAGS = -std=c++17 -O3 -lcublas
 ARCH = sm_90
 
 all: test_gemm
