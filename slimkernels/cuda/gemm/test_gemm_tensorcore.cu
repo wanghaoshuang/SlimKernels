@@ -224,31 +224,6 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     float alpha = 1.0f;
     float beta = 0.0f;
     
-    // 预热
-    // for (int i = 0; i < 10; ++i) {
-    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
-    // }
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // 测试基础kernel性能
-    // auto start = std::chrono::high_resolution_clock::now();
-    // for (int i = 0; i < num_runs; ++i) {
-    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
-    // }
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // auto end = std::chrono::high_resolution_clock::now();
-    
-    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    // double avg_time_ms = duration.count() / 1000.0 / num_runs;
-    
-    // // 计算理论性能
-    // double flops = 2.0 * M * N * K;
-    // double gflops = (flops / avg_time_ms) / 1e6;
-    
-    // std::cout << "Basic GEMM Kernel:" << std::endl;
-    // std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
-    // std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
-    
     // 测试优化kernel性能
     CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
     
@@ -273,9 +248,16 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     // 测试Tensor Core kernel性能 (纯half)
     CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
     
+    MMAarguments mmaArg{
+                {M, N, K}, // problem shape
+                d_A_half,
+                d_B_half,
+                d_C,
+                d_C
+            };
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_runs; ++i) {
-        gemm_tensor_core_kernel<<<tensor_grid_size, tensor_block_size>>>(d_A_half, d_B_half, d_C, M, N, K, alpha, beta);
+        launch_GEMM_MMA(mmaArg);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     end = std::chrono::high_resolution_clock::now();
