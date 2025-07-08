@@ -19,13 +19,6 @@ using ElementOutput = float;                        // <- data type of elements 
 const int M = 16;
 const int N = 8;
 const int K = 8;
-struct MMAarguments {
-    cutlass::gemm::GemmCoord problem_size;
-    ElementInputA *A;
-    ElementInputB *B;
-    ElementAccumulator *C;
-    ElementOutput *D;
-};
 
 __device__ void loadtileC(MMAarguments &arg,ElementOutput *C){
     // iter = 128 * 64 / 128

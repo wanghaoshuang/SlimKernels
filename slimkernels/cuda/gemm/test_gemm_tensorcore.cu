@@ -94,10 +94,6 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     dim3 block_size(32, 32);
     dim3 grid_size((N + block_size.x - 1) / block_size.x, (M + block_size.y - 1) / block_size.y);
     
-    // Tensor Core kernel配置 (16x16 tile)
-    dim3 tensor_block_size(256); // 8 warps
-    dim3 tensor_grid_size((N + 15) / 16, (M + 15) / 16);
-
     float alpha = 1.0f;
     float beta = 0.0f;
     
@@ -127,8 +123,8 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     
     MMAarguments mmaArg{
                 {M, N, K}, // problem shape
-                d_A_half,
-                d_B_half,
+                d_A,
+                d_B,
                 d_C,
                 d_C
             };
