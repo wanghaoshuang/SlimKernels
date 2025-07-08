@@ -1,3 +1,8 @@
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/kernel/default_gemm.h"
+#include "cutlass/gemm/kernel/gemm.h"
+#include "gemm.h"
+
 #include <iostream>
 #include <functional>
 
@@ -5,8 +10,8 @@
 // elements in input matrices.
 using ElementAccumulator = float;                   // <- data type of accumulator
 using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
-using ElementInputA = cutlass::tfloat32_t;          // <- data type of elements in input matrix A
-using ElementInputB = cutlass::tfloat32_t;          // <- data type of elements in input matrix B
+using ElementInputA = float;          // <- data type of elements in input matrix A
+using ElementInputB = float;          // <- data type of elements in input matrix B
 using ElementOutput = float;                        // <- data type of elements in output matrix D
 
 
@@ -14,8 +19,7 @@ using ElementOutput = float;                        // <- data type of elements 
 const int M = 16;
 const int N = 8;
 const int K = 8;
-
-struct MMAarguments{
+struct MMAarguments {
     cutlass::gemm::GemmCoord problem_size;
     ElementInputA *A;
     ElementInputB *B;

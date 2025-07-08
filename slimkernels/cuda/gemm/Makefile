@@ -4,8 +4,8 @@ ARCH = sm_90
 
 all: test_gemm
 
-test_gemm: test_gemm_tensorcore.cu
-	$(NVCC) $(NVCC_FLAGS) -arch=$(ARCH) $< -o $@
+test_gemm: test_gemm_tensorcore.cu gemm_baseline.cu gemm_tensorcore.cu
+	$(NVCC) $(NVCC_FLAGS) -arch=$(ARCH) test_gemm_tensorcore.cu gemm_baseline.cu gemm_tensorcore.cu -o test_gemm
 
 debug: test_gemm.cu
 	$(NVCC) $(NVCC_FLAGS) -arch=$(ARCH) -g -G $< -o test_gemm_debug
