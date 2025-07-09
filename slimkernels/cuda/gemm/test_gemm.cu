@@ -8,58 +8,9 @@
 #include <fstream>
 #include <cstring>
 #include <tuple>
+#include <mma.h>
+#include "gemm.h"
 
-// 优化的GEMM kernel (使用共享内存)
-__global__ void gemm_optimized_kernel(
-    const float* A, 
-    const float* B, 
-    float* C, 
-    const int M, 
-    const int N, 
-    const int K,
-    const float alpha,
-    const float beta
-) {
-    const int TILE_SIZE = 32;
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
-    
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    
-    float sum = 0.0f;
-    
-    for (int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
-        // 加载tile到共享内存
-        int tileRow = tile * TILE_SIZE + threadIdx.y;
-        int tileCol = tile * TILE_SIZE + threadIdx.x;
-        
-        if (row < M && tileCol < K) {
-            tileA[threadIdx.y][threadIdx.x] = A[row * K + tileCol];
-        } else {
-            tileA[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        
-        if (tileRow < K && col < N) {
-            tileB[threadIdx.y][threadIdx.x] = B[tileRow * N + col];
-        } else {
-            tileB[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-        
-        __syncthreads();
-        
-        // 计算tile内的点积
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            sum += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
-        }
-        
-        __syncthreads();
-    }
-    
-    if (row < M && col < N) {
-        C[row * N + col] = alpha * sum + beta * C[row * N + col];
-    }
-}
 
 // CUDA错误检查宏
 #define CUDA_CHECK(call) \
@@ -72,17 +23,7 @@ __global__ void gemm_optimized_kernel(
         } \
     } while(0)
 
-// cuBLAS错误检查宏 (老版本API)
-#define CUBLAS_CHECK(call) \
-    do { \
-        call; \
-        cudaError_t err = cudaGetLastError(); \
-        if (err != cudaSuccess) { \
-            std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ << " - " \
-                      << cudaGetErrorString(err) << std::endl; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
+
 
 // 生成随机数据
 void generate_random_data(float* data, int size, float min_val = -1.0f, float max_val = 1.0f) {
@@ -95,23 +36,15 @@ void generate_random_data(float* data, int size, float min_val = -1.0f, float ma
     }
 }
 
-
-
-// cuBLAS GEMM实现 (老版本API)
-void cublas_gemm(
-    const float* A, 
-    const float* B, 
-    float* C, 
-    const int M, 
-    const int N, 
-    const int K,
-    const float alpha,
-    const float beta
-) {
-    // 老版本cuBLAS API
-    // sgemm(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
-    // 其中: 'N'表示不转置, 'T'表示转置
-    CUBLAS_CHECK(cublasSgemm('N', 'N', M, N, K, alpha, A, M, B, K, beta, C, M));
+// 生成随机half数据
+void generate_random_half_data(half* data, int size, float min_val = -1.0f, float max_val = 1.0f) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(min_val, max_val);
+    
+    for (int i = 0; i < size; ++i) {
+        data[i] = __float2half(dis(gen));
+    }
 }
 
 // 性能测试函数
@@ -124,6 +57,8 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     std::vector<float> h_B(K * N);
     std::vector<float> h_C(M * N);
     std::vector<float> h_C_ref(M * N);
+    std::vector<half> h_A_half(M * K);
+    std::vector<half> h_B_half(K * N);
     
     // 生成随机数据
     generate_random_data(h_A.data(), M * K);
@@ -131,16 +66,29 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     generate_random_data(h_C.data(), M * N);
     std::memcpy(h_C_ref.data(), h_C.data(), M * N * sizeof(float));
     
+    // 转换为half精度
+    for (int i = 0; i < M * K; ++i) {
+        h_A_half[i] = __float2half(h_A[i]);
+    }
+    for (int i = 0; i < K * N; ++i) {
+        h_B_half[i] = __float2half(h_B[i]);
+    }
+
     // 分配设备内存
     float *d_A, *d_B, *d_C;
+    half *d_A_half, *d_B_half;
     CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_A_half, M * K * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_B_half, K * N * sizeof(half)));
     
     // 复制数据到设备
     CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_C, h_C.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_half, h_A_half.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_half, h_B_half.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
     // 配置kernel参数
     dim3 block_size(32, 32);
@@ -148,31 +96,6 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     
     float alpha = 1.0f;
     float beta = 0.0f;
-    
-    // 预热
-    // for (int i = 0; i < 10; ++i) {
-    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
-    // }
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // 测试基础kernel性能
-    // auto start = std::chrono::high_resolution_clock::now();
-    // for (int i = 0; i < num_runs; ++i) {
-    //     gemm_kernel<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
-    // }
-    // CUDA_CHECK(cudaDeviceSynchronize());
-    // auto end = std::chrono::high_resolution_clock::now();
-    
-    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    // double avg_time_ms = duration.count() / 1000.0 / num_runs;
-    
-    // // 计算理论性能
-    // double flops = 2.0 * M * N * K;
-    // double gflops = (flops / avg_time_ms) / 1e6;
-    
-    // std::cout << "Basic GEMM Kernel:" << std::endl;
-    // std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
-    // std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
     
     // 测试优化kernel性能
     CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
@@ -195,6 +118,30 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
     std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
     
+    // 测试Tensor Core kernel性能 (纯half)
+    CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
+    
+    MMAarguments mmaArg{
+                {M, N, K}, // problem shape
+                d_A,
+                d_B,
+                d_C,
+                d_C
+            };
+    start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < num_runs; ++i) {
+        launch_GEMM_MMA(mmaArg);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    end = std::chrono::high_resolution_clock::now();
+    
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    avg_time_ms = duration.count() / 1000.0 / num_runs;
+    gflops = (flops / avg_time_ms) / 1e6;
+    
+    std::cout << "Tensor Core GEMM (Half):" << std::endl;
+    std::cout << "  Average time: " << std::fixed << std::setprecision(3) << avg_time_ms << " ms" << std::endl;
+    std::cout << "  Performance: " << std::fixed << std::setprecision(2) << gflops << " GFLOPS" << std::endl;
     
     // 测试cuBLAS性能
     CUDA_CHECK(cudaMemcpy(d_C, h_C_ref.data(), M * N * sizeof(float), cudaMemcpyHostToDevice));
@@ -218,7 +165,8 @@ void benchmark_gemm(int M, int K, int N, int num_runs = 100) {
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
-    
+    CUDA_CHECK(cudaFree(d_A_half));
+    CUDA_CHECK(cudaFree(d_B_half));
 }
 
 
