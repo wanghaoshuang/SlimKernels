@@ -17,8 +17,11 @@ test_gemm_prefetch: test_gemm.cu gemm_baseline.cu gemm_prefetch.cu
 test_gemm_shape: test_gemm.cu gemm_baseline.cu gemm_shape.cu
 	$(NVCC) $(NVCC_FLAGS) -I$(CUTLASS_INCLUDE) -arch=$(ARCH) test_gemm.cu gemm_baseline.cu gemm_shape.cu -o test_gemm_shape
 
+test_gemm_bc: test_gemm.cu gemm_baseline.cu gemm_bc.cu
+	$(NVCC) $(NVCC_FLAGS) -I$(CUTLASS_INCLUDE) -arch=$(ARCH) test_gemm.cu gemm_baseline.cu gemm_bc.cu -o test_gemm_bc
+
 clean:
-	rm -f test_gemm_baseline test_gemm_reg test_gemm_prefetch test_gemm_shape
+	rm -f test_gemm_baseline test_gemm_reg test_gemm_prefetch test_gemm_shape test_gemm_bc
 
 run: test_gemm_shape
 	./test_gemm_shape
