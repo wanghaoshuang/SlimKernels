@@ -109,10 +109,10 @@ __device__ void mma_tile(MMAarguments &arg,ElementInputA *A,ElementInputB *B,Ele
 
         int b_addr = (colwarp * WARP_SHAPE_N + coltile * TENSOR_CORE_N) * TENSOR_CORE_K + (laneidx / 4) * num_per_thread + (laneidx % 4) * TENSOR_CORE_N;
         asm volatile(
-                "ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%0, %1}, [%4];" 
+                "ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%0, %1}, [%2];" 
                 : 
                 "=r"(*(uint32_t*)&b[0]), 
-                "=r"(*(uint32_t*)&b[1]), 
+                "=r"(*(uint32_t*)&b[1])
                 : 
                 "r"((uint32_t)__cvta_generic_to_shared(&B[b_addr])) 
             );
