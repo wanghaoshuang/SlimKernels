@@ -28,6 +28,7 @@ struct GemmConfig {
 };
 
 
+
 template<typename GemmConfig>
 struct Index{
 
