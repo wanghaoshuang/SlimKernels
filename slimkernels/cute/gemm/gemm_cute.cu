@@ -1,15 +1,13 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
-
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
-
 #include <cute/tensor.hpp>
-
-#include "cutlass/util/print_error.hpp"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/helper_cuda.hpp"
+#include <cute/underscore.hpp>
+#include <cute/numeric/integral_constant.hpp>
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/kernel/default_gemm.h"
+#include "cutlass/gemm/kernel/gemm.h"
+#include "gemm.h"
 
 using namespace cute;
 
@@ -43,17 +41,16 @@ template<typename Config>
 __global__ void GEMM_MMA(MMAarguments arg){
     auto shape_MNK = make_shape(arg.problem_size.m(), arg.problem_size.n(), arg.problem_size.k());
     // Represent the full tensors
-    Tensor mA = make_tensor(make_gmem_ptr(arg.A), select<0,2>(shape_MNK), make_stride(arg.problem_size.k(), _1)); // (M,K)
-    Tensor mB = make_tensor(make_gmem_ptr(arg.B), select<1,2>(shape_MNK), make_stride(arg.problem_size.k(), _1)); // (N,K)
-    Tensor mC = make_tensor(make_gmem_ptr(arg.C), select<0,1>(shape_MNK), make_stride(_1, arg.problem_size.m())); // (M,N)
+    Tensor mA = make_tensor(make_gmem_ptr(arg.A), select<0,2>(shape_MNK), make_stride(arg.problem_size.k(), _1{})); // (M,K)
+    Tensor mB = make_tensor(make_gmem_ptr(arg.B), select<1,2>(shape_MNK), make_stride(arg.problem_size.k(), _1{})); // (N,K)
+    Tensor mC = make_tensor(make_gmem_ptr(arg.C), select<0,1>(shape_MNK), make_stride(_1{}, arg.problem_size.m())); // (M,N)
 
     // Define CTA tile sizes (static)
     auto cta_tiler = make_shape(Int<Config::BLOCK_DIM_M>{}, Int<Config::BLOCK_DIM_N>{}, Int<Config::BLOCK_DIM_K>{});                   // (BLK_M, BLK_N, BLK_K)
     
     // Define the smem layouts (static)
-    auto sA = make_layout(make_shape(Int<Config::BLOCK_DIM_M>{},Int<Config::BLOCK_DIM_K>{}), LayoutRight{});   // (m,k) -> smem_idx; k-major
-    auto sB = make_layout(make_shape(Int<Config::BLOCK_DIM_N>{},Int<Config::BLOCK_DIM_K>{}), LayoutRight{});   // (n,k) -> smem_idx; k-major
-    auto sC = make_layout(make_shape(Int<Config::BLOCK_DIM_M>{}, Int<Config::BLOCK_DIM_N>{}));                 // (m,n) -> smem_idx; m-major
+    auto sA_layout = make_layout(make_shape(Int<Config::BLOCK_DIM_M>{},Int<Config::BLOCK_DIM_K>{}), LayoutRight{});   // (m,k) -> smem_idx; k-major
+    auto sB_layout = make_layout(make_shape(Int<Config::BLOCK_DIM_N>{},Int<Config::BLOCK_DIM_K>{}), LayoutRight{});   // (n,k) -> smem_idx; k-major
 
     // Define the thread layouts (static)
     auto tA = make_layout(make_shape(Int<32>{}, Int< 8>{}), LayoutRight{});  // (m,k) -> thr_idx; k-major

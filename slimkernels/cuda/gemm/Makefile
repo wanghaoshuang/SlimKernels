@@ -1,7 +1,7 @@
 NVCC = nvcc
 NVCC_FLAGS = -std=c++17 -O3 -lcublas
 ARCH = sm_90
-CUTLASS_INCLUDE = /root/paddlejob/workspace/env_run/output/whs/complier/cutlass_gemv/cutlass/include
+CUTLASS_INCLUDE = /root/paddlejob/workspace/env_run/output/whs/cutlass/include
 
 TARGETS = \
     test_gemm_baseline \
@@ -10,8 +10,7 @@ TARGETS = \
     test_gemm_shape \
     test_gemm_bc \
     test_gemm_ldmatrix \
-    test_gemm_swizzle \
-    test_gemm_cute
+    test_gemm_swizzle
 
 all: $(TARGETS)
 
@@ -34,9 +33,6 @@ test_gemm_ldmatrix: test_gemm.cu gemm_baseline.cu gemm_ldmatrix.cu
 	$(NVCC) $(NVCC_FLAGS) -I$(CUTLASS_INCLUDE) -arch=$(ARCH) $^ -o $@
 
 test_gemm_swizzle: test_gemm.cu gemm_baseline.cu gemm_swizzle.cu
-	$(NVCC) $(NVCC_FLAGS) -I$(CUTLASS_INCLUDE) -arch=$(ARCH) $^ -o $@
-
-test_gemm_cute: test_gemm.cu gemm_baseline.cu gemm_cute.cu
 	$(NVCC) $(NVCC_FLAGS) -I$(CUTLASS_INCLUDE) -arch=$(ARCH) $^ -o $@
 
 clean:
