@@ -13,18 +13,16 @@ using namespace cute;
 
 // The code section below describes datatype for input, output matrices and computation between
 // elements in input matrices.
-using ElementAccumulator = float;                   // <- data type of accumulator
-using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
-using ElementInputA = float;          // <- data type of elements in input matrix A
-using ElementInputB = float;          // <- data type of elements in input matrix B
-using ElementOutput = float;                        // <- data type of elements in output matrix D
+using ElementInputA = half;          // <- data type of elements in input matrix A
+using ElementInputB = half;          // <- data type of elements in input matrix B
+using ElementOutput = half;                        // <- data type of elements in output matrix D
 
 const int  THREADS_PER_WARP=32;
 
 struct GemmConfig {
     static constexpr int BLOCK_DIM_M = 128;
     static constexpr int BLOCK_DIM_N = 128;
-    static constexpr int BLOCK_DIM_K = 16;
+    static constexpr int BLOCK_DIM_K = 32;
     static constexpr int WARP_TILE_DIM_M = 64;
     static constexpr int WARP_TILE_DIM_N = 64;
     static constexpr int THREAD_NUM = 256;
@@ -35,11 +33,13 @@ struct GemmConfig {
 
 template <typename GemmConfig>
 struct CuTeGemmConfig {
+  using T = ElementInputA;
   // tile configuration
   static constexpr int kTileM = GemmConfig::BLOCK_DIM_M;
   static constexpr int kTileN = GemmConfig::BLOCK_DIM_N;
   static constexpr int kTileK = GemmConfig::BLOCK_DIM_K;
-  static constexpr int kStage = 5;
+  static constexpr int kStage = 2;
+  static constexpr int kSmemLayoutCBatch = 2;
 
   static constexpr int kShmLoadSwizzleM = 3;
   static constexpr int kShmLoadSwizzleS = 3;
@@ -125,6 +125,9 @@ struct CuTeGemmConfig {
 template<typename Config>
 __global__ void GEMM_MMA(MMAarguments arg){
     auto shape_MNK = make_shape(arg.problem_size.m(), arg.problem_size.n(), arg.problem_size.k());
+    auto m = arg.problem_size.m();
+    auto n = arg.problem_size.n();
+    auto k = arg.problem_size.k();
     using namespace cute;
     using X = Underscore;
 
@@ -146,11 +149,6 @@ __global__ void GEMM_MMA(MMAarguments arg){
     constexpr int kTileN = Config::kTileN;
     constexpr int kTileK = Config::kTileK;
     constexpr int kStage = Config::kStage;
-    
-    constexpr int kTileM = Config::kTileM;
-  constexpr int kTileN = Config::kTileN;
-  constexpr int kTileK = Config::kTileK;
-  constexpr int kStage = Config::kStage;
 
   extern __shared__ T shm_data[];
 
@@ -162,11 +160,11 @@ __global__ void GEMM_MMA(MMAarguments arg){
   int iy = blockIdx.y;
 
   // use Tensor notation to represent device pointer + dimension
-  Tensor A = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k),
+  Tensor A = make_tensor(make_gmem_ptr((T *)arg.A), make_shape(m, k),
                          make_stride(k, Int<1>{}));  // (M, K)
-  Tensor B = make_tensor(make_gmem_ptr((T *)Bptr), make_shape(n, k),
+  Tensor B = make_tensor(make_gmem_ptr((T *)arg.B), make_shape(n, k),
                          make_stride(k, Int<1>{}));  // (N, K)
-  Tensor D = make_tensor(make_gmem_ptr((T *)Dptr), make_shape(m, n),
+  Tensor D = make_tensor(make_gmem_ptr((T *)arg.C), make_shape(m, n),
                          make_stride(n, Int<1>{}));  // (M, N)
 
   // slice the tensor to small one which is used for current thread block.
@@ -328,6 +326,17 @@ __global__ void GEMM_MMA(MMAarguments arg){
 
 }
 
+// CUDA错误检查宏
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
+                      << cudaGetErrorString(err) << std::endl; \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
 void launch_GEMM_MMA(MMAarguments &arg){
     dim3 grid,block;
     grid.x = (arg.problem_size.n()+GemmConfig::BLOCK_DIM_N-1)/GemmConfig::BLOCK_DIM_N;
@@ -337,8 +346,17 @@ void launch_GEMM_MMA(MMAarguments &arg){
     block.x = CuTeGemmConfig<GemmConfig>::kThreadNum;
     block.y = 1;
     block.z = 1;
+    int shm_size = CuTeGemmConfig<GemmConfig>::kShmSize;
+    printf("shm_size: %d\n", shm_size);
 
-    GEMM_MMA<CuTeGemmConfig<GemmConfig>><<<grid,block>>>(arg);
-    
-    
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, (const void*)GEMM_MMA<CuTeGemmConfig<GemmConfig>>);
+    printf("Max dynamic shared memory: %zu\n", attr.maxDynamicSharedSizeBytes);
+
+
+    GEMM_MMA<CuTeGemmConfig<GemmConfig>><<<grid,block,shm_size>>>(arg);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA launch error: %s\n", cudaGetErrorString(err));
+    }
 }

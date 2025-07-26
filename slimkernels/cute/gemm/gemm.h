@@ -3,11 +3,11 @@
 
 #include <cutlass/gemm/device/gemm.h>
 
-using ElementAccumulator = float;
+using ElementAccumulator = half;
 using ElementComputeEpilogue = ElementAccumulator;
-using ElementInputA = float;
-using ElementInputB = float;
-using ElementOutput = float;
+using ElementInputA = half;
+using ElementInputB = half;
+using ElementOutput = half;
 
 struct MMAarguments {
     cutlass::gemm::GemmCoord problem_size;
