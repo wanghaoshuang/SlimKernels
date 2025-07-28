@@ -1,5 +1,5 @@
 NVCC = nvcc
-NVCC_FLAGS = -std=c++17 -O3 -lcublas
+NVCC_FLAGS = -std=c++17 -O3 -lcublas -lineinfo --expt-relaxed-constexpr
 ARCH = sm_90
 CUTLASS_INCLUDE = /root/paddlejob/workspace/env_run/output/whs/cutlass/include
 

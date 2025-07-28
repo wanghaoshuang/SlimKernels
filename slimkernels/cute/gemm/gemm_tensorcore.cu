@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cassert>
+#include <iostream>
 #include <cute/tensor.hpp>
 #include <cute/underscore.hpp>
 #include <cute/numeric/integral_constant.hpp>
@@ -17,12 +18,10 @@ using ElementInputA = half;          // <- data type of elements in input matrix
 using ElementInputB = half;          // <- data type of elements in input matrix B
 using ElementOutput = half;                        // <- data type of elements in output matrix D
 
-const int  THREADS_PER_WARP=32;
-
 struct GemmConfig {
     static constexpr int BLOCK_DIM_M = 128;
     static constexpr int BLOCK_DIM_N = 128;
-    static constexpr int BLOCK_DIM_K = 32;
+    static constexpr int BLOCK_DIM_K = 64;
     static constexpr int WARP_TILE_DIM_M = 64;
     static constexpr int WARP_TILE_DIM_N = 64;
     static constexpr int THREAD_NUM = 256;
@@ -38,7 +37,7 @@ struct CuTeGemmConfig {
   static constexpr int kTileM = GemmConfig::BLOCK_DIM_M;
   static constexpr int kTileN = GemmConfig::BLOCK_DIM_N;
   static constexpr int kTileK = GemmConfig::BLOCK_DIM_K;
-  static constexpr int kStage = 2;
+  static constexpr int kStage = 4;
   static constexpr int kSmemLayoutCBatch = 2;
 
   static constexpr int kShmLoadSwizzleM = 3;
@@ -67,7 +66,7 @@ struct CuTeGemmConfig {
   using mma_atom_shape = mma_traits::Shape_MNK;
   static constexpr int kMmaPM = 1 * kMmaEURepeatM * get<0>(mma_atom_shape{});
   static constexpr int kMmaPN = 2 * kMmaEURepeatN * get<1>(mma_atom_shape{});
-  static constexpr int kMmaPK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{});
+  static constexpr int kMmaPK = 2 * kMmaEURepeatK * get<2>(mma_atom_shape{});
   using MMA_EU_RepeatT = decltype(make_layout(make_shape(
       Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
   using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
@@ -81,8 +80,13 @@ struct CuTeGemmConfig {
       decltype(make_tiled_copy(g2s_copy_atom{},
                                make_layout(make_shape(Int<32>{}, Int<4>{}),
                                            make_stride(Int<4>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
+                               make_layout(make_shape(Int<1>{}, Int<16>{}))));
   using G2SCopyB = G2SCopyA;
+  // using G2SCopyB = 
+  //     decltype(make_tiled_copy(g2s_copy_atom{},
+  //                              make_layout(make_shape(Int<4>{}, Int<32>{}),
+  //                                          make_stride(Int<1>{}, Int<4>{})),
+  //                              make_layout(make_shape(Int<8>{}, Int<1>{}), make_stride(Int<1>{}, Int<8>{}))));
 
   // define copy from shared memory to registers
   using s2r_copy_op = SM75_U32x4_LDSM_N;
@@ -116,7 +120,6 @@ struct CuTeGemmConfig {
   static constexpr int shm_size_AB =
       cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{});
   static constexpr int shm_size_C = cute::cosize(SmemLayoutC{});
-
   static constexpr int kShmSize =
       cute::max(shm_size_AB, shm_size_C) * sizeof(T);
 };
@@ -338,21 +341,37 @@ __global__ void GEMM_MMA(MMAarguments arg){
     } while(0)
 
 void launch_GEMM_MMA(MMAarguments &arg){
+    using CuTeConfig = CuTeGemmConfig<GemmConfig>;
     dim3 grid,block;
     grid.x = (arg.problem_size.n()+GemmConfig::BLOCK_DIM_N-1)/GemmConfig::BLOCK_DIM_N;
     grid.y = (arg.problem_size.m()+GemmConfig::BLOCK_DIM_M-1)/GemmConfig::BLOCK_DIM_M;
     grid.z = 1;
 
-    block.x = CuTeGemmConfig<GemmConfig>::kThreadNum;
+    block.x = CuTeConfig::kThreadNum;
     block.y = 1;
     block.z = 1;
+
+    
+    // std::cout << "SmemLayoutA" <<CuTeConfig::SmemLayoutA{} <<std::endl;
+    // std::cout << "SmemLayoutB" <<CuTeConfig::SmemLayoutB{} <<std::endl;
+    // std::cout << "SmemLayoutB" <<CuTeConfig::SmemLayoutC{} <<std::endl;
+
     int shm_size = CuTeGemmConfig<GemmConfig>::kShmSize;
-    printf("shm_size: %d\n", shm_size);
+    // CuTeConfig::MMA mma;
+    // print_latex(mma);
+    // print(mma);
+    // printf("CuTeConfig::kThreadNum: %d\n", CuTeConfig::kThreadNum);
+    // printf("shm_size: %d\n", shm_size);
 
-    cudaFuncAttributes attr;
-    cudaFuncGetAttributes(&attr, (const void*)GEMM_MMA<CuTeGemmConfig<GemmConfig>>);
-    printf("Max dynamic shared memory: %zu\n", attr.maxDynamicSharedSizeBytes);
-
+    cudaFuncSetAttribute((const void*)GEMM_MMA<CuTeGemmConfig<GemmConfig>>, cudaFuncAttributeMaxDynamicSharedMemorySize, 227304);
+    
+    // cudaFuncAttributes attr;
+    // cudaFuncGetAttributes(&attr, (const void*)GEMM_MMA<CuTeGemmConfig<GemmConfig>>);
+    // printf("Max dynamic shared memory: %zu\n", attr.maxDynamicSharedSizeBytes);
+    // CuTeConfig::G2SCopyA g2s_tiled_copy_a;
+    // print_latex(g2s_tiled_copy_a);
+    // CuTeConfig::G2SCopyB g2s_tiled_copy_b;
+    // print_latex(g2s_tiled_copy_b);
 
     GEMM_MMA<CuTeGemmConfig<GemmConfig>><<<grid,block,shm_size>>>(arg);
     cudaError_t err = cudaGetLastError();
