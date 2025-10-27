@@ -7,17 +7,24 @@
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/kernel/gemm.h"
-#include "gemm.h"
+// #include "gemm.h"
 
 using namespace cute;
 
 // The code section below describes datatype for input, output matrices and computation between
 // elements in input matrices.
-using ElementAccumulator = float;                   // <- data type of accumulator
-using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
 using ElementInputA = float;          // <- data type of elements in input matrix A
 using ElementInputB = float;          // <- data type of elements in input matrix B
 using ElementOutput = float;                        // <- data type of elements in output matrix D
+using ElementAccumulator = float;
+
+struct MMAarguments {
+    cutlass::gemm::GemmCoord problem_size;
+    ElementInputA *A;
+    ElementInputB *B;
+    ElementAccumulator *C;
+    ElementOutput *D;
+};
 
 const int  THREADS_PER_WARP=32;
 

@@ -8,15 +8,25 @@
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/kernel/gemm.h"
-#include "gemm.h"
+// #include "gemm.h"
 
 using namespace cute;
 
 // The code section below describes datatype for input, output matrices and computation between
 // elements in input matrices.
+
 using ElementInputA = half;          // <- data type of elements in input matrix A
 using ElementInputB = half;          // <- data type of elements in input matrix B
 using ElementOutput = half;                        // <- data type of elements in output matrix D
+using ElementAccumulator = half;
+
+struct MMAarguments {
+    cutlass::gemm::GemmCoord problem_size;
+    ElementInputA *A;
+    ElementInputB *B;
+    ElementAccumulator *C;
+    ElementOutput *D;
+};
 
 struct GemmConfig {
     static constexpr int BLOCK_DIM_M = 128;

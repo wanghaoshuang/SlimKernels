@@ -167,9 +167,9 @@ int main() {
     
     // 性能测试
     std::vector<std::tuple<int, int, int>> test_cases = {
-    // std::make_tuple(512, 512, 512),
-    // std::make_tuple(1024, 1024, 1024),
-    // std::make_tuple(2048, 2048, 2048),
+    std::make_tuple(512, 512, 512),
+    std::make_tuple(1024, 1024, 1024),
+    std::make_tuple(2048, 2048, 2048),
     std::make_tuple(4096, 4096, 4096)
     };
     

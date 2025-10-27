@@ -11,8 +11,8 @@ using ElementOutput = half;
 
 struct MMAarguments {
     cutlass::gemm::GemmCoord problem_size;
-    ElementInputA *A;
-    ElementInputB *B;
+    ElementInputA_ *A;
+    ElementInputB_ *B;
     ElementAccumulator *C;
     ElementOutput *D;
 };
