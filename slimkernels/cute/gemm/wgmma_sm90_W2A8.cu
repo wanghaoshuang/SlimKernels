@@ -56,7 +56,7 @@ struct SharedStorage
 };
 
 template <class ProblemShape, class CtaTiler,
-          class TA, class AStride, class ASmemLayout, class TiledCopyA,
+          class TA, class AStride, class ASmemLayout, class TiledCopyA, class S2RAtomA,
           class TB, class BStride, class BSmemLayout, class TiledCopyB,
           class TC, class CStride, class TiledMma,
           class Alpha, class Beta>
@@ -64,7 +64,7 @@ __global__ static
 __launch_bounds__(decltype(size(TiledMma{}))::value)
 void
 gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
-            TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a,
+            TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
             TB const* B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b,
             TC      * C, CStride dC, TiledMma mma,
             Alpha alpha, Beta beta)
@@ -159,8 +159,15 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
   Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
 
+  
   // Allocate registers for pipelining
-  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+  // Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0));   // (MMA,MMA_M,MMA_K)
+  TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
+  ThrCopy   s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
+  Tensor tXsA = s2r_thr_copy_a.partition_S(sA);                        // (CPY,MMA_M,MMA_K,PIPE)
+  Tensor tXrA = s2r_thr_copy_a.retile_D(tCrA);                         // (CPY,MMA_M,MMA_K)
+
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
   // Allocate the accumulators -- same size as the projected data
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
@@ -189,15 +196,23 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     print("tBsB : "); print(tBsB); print("\n");
   }
 
+  
+
   if(thread0()) {
     print("  mC : "); print(  mC); print("\n");
     print("  gC : "); print(  gC); print("\n");
     print("tCsA : "); print(tCsA); print("\n");
     print("tCsB : "); print(tCsB); print("\n");
     print("tCgC : "); print(tCgC); print("\n");
-    print("tCrA : "); print(tCrA); print("\n");
     print("tCrB : "); print(tCrB); print("\n");
     print("tCrC : "); print(tCrC); print("\n");
+  }
+
+  
+  if(thread0()) {
+    print("tCrA : "); print(tCrA); print("\n");
+    print("tXsA : "); print(tXsA); print("\n");
+    print("tXrA : "); print(tXrA); print("\n");
   }
 #endif
 
@@ -218,7 +233,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   {
     copy(copy_a, tAgA(_,_,_,k), tAsA(_,_,_,k));
     copy(copy_b, tBgB(_,_,_,k), tBsB(_,_,_,k));
-    cp_async_fence();
+    cp_async_fence(); // cp.async.commit_group;
   }
 
   // Clear the accumulators
@@ -245,9 +260,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     // Copy gmem to smem for k_tile_write
     //
 
+
     copy(copy_a, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,k_pipe_write));
     copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,k_pipe_write));
-    cp_async_fence();
+    cp_async_fence(); // cp.async.commit_group;
 
     // Advance k_pipe_write
     ++k_pipe_write;
@@ -259,15 +275,17 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 
     // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
     cp_async_wait<0>();
+    copy(s2r_atom_a, tXsA(_,_,_, k_pipe_read), tXrA);
+    warpgroup_fence_operand(tCrC);
+    warpgroup_fence_operand(tCrA);
 
+    warpgroup_arrive(); // wgmma.fence.sync.aligned;
+    cute::gemm(mma, tCrA, tCrB(_,_,_,k_pipe_read), tCrC);
+    warpgroup_commit_batch(); // wgmma.commit_group.sync.aligned;
+    // Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
+    warpgroup_wait<0>(); // wgmma.wait_group.sync.aligned %0
     warpgroup_fence_operand(tCrC);
-    warpgroup_arrive();
-    // (V,M,K) x (V,N,K) => (V,M,N)
-    cute::gemm(mma, tCrA(_,_,_,k_pipe_read), tCrB(_,_,_,k_pipe_read), tCrC);
-    warpgroup_commit_batch();
-    /// Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(tCrC);
+    warpgroup_fence_operand(tCrA);
 
     // Advance k_pipe_read
     ++k_pipe_read;
@@ -326,10 +344,12 @@ gemm_tn(int m, int n, int k,
                                     Layout<Shape<_32,_4>,Stride<_4,_1>>{}, // Thr layout 16x8 k-major
                                     Layout<Shape< _1,_16>>{});              // Val layout  1x8
 
-  TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x32_F16E4M3E4M3_SS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{}); // scaleIn=one, scaleOut=one
+  Copy_Atom<SM75_U32x4_LDSM_N, TB> s2r_atom_A;
+  TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x32_F16E4M3E4M3_RS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{}); // scaleIn=one, scaleOut=one
 
-#if 0
+#if 1
   print("  copyA : "); print(  copyA); print("\n");
+  print("  s2r_atom_A : "); print(  s2r_atom_A); print("\n");
   print("  copyB : "); print(  copyB); print("\n");
   print("  tiled_mma : "); print(  tiled_mma); print("\n");
   print("  sA : "); print(  sA); print("\n");
@@ -355,7 +375,7 @@ gemm_tn(int m, int n, int k,
 
   void const* kernel_ptr = reinterpret_cast<void const*>(
                               &gemm_device<decltype(prob_shape), decltype(cta_tiler),
-                                           TA, decltype(dA), decltype(sA), decltype(copyA),
+                                           TA, decltype(dA), decltype(sA), decltype(copyA), decltype(s2r_atom_A),
                                            TB, decltype(dB), decltype(sB), decltype(copyB),
                                            TC, decltype(dC), decltype(tiled_mma),
                                            decltype(alpha), decltype(beta)>);
@@ -368,7 +388,7 @@ gemm_tn(int m, int n, int k,
   // Kernel Launch
   cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
                                                              prob_shape, cta_tiler,
-                                                             A, dA, sA, copyA,
+                                                             A, dA, sA, copyA, s2r_atom_A,
                                                              B, dB, sB, copyB,
                                                              C, dC, tiled_mma,
                                                              alpha, beta);
@@ -402,6 +422,10 @@ int main(int argc, char** argv)
   int m = 5120;
   int n = 5120;
   int k = 4096;
+
+  // int m = 128;
+  // int n = 128;
+  // int k = 64*63;
 
   using TA = cute::float_e4m3_t;
   using TB = cute::float_e4m3_t;
