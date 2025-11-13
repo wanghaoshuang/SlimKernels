@@ -25,6 +25,9 @@ wgmma: wgmma_sm90.cu
 wgmma_fp8: wgmma_sm90_fp8.cu
 	$(NVCC) $(NVCC_FLAGS) $(CUTLASS_INCLUDE) -arch=$(ARCH) $^ -o $@
 
+wgmma_w2a8: wgmma_sm90_W2A8.cu
+	$(NVCC) $(NVCC_FLAGS) $(CUTLASS_INCLUDE) -arch=$(ARCH) $^ -o $@
+
 clean:
 	rm -f $(TARGETS)
 
