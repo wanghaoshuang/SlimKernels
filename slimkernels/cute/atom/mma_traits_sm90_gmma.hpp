@@ -49,7 +49,10 @@ struct MMA_Traits<SM90_64x64x64_F16I2E4M3_RS_TN_A<scaleA, scaleB>>
     using FrgTypeB = GMMA::smem_desc<GMMA::Major::K>;
     using Shape_MNK = Shape<_64, _64, _16>;
     using ThrID = Layout<_128>;
-    using ALayout = GMMA::ALayout_64x16;
+    // ((4,8,4),(4,2)):((4, 16, 256),(1, 128)) row-major
+    // using ALayout = Layout<Shape <Shape<_4, _8, _4>,Shape<_4, _2>>, Stride<Stride<_4,_16,_256>,Stride<_1,_128>>>;
+    // ((4,8,4),(4,2)):((256, 1, 16),(64, 8)) column-major
+    using ALayout = Layout<Shape <Shape<_4, _8, _4>,Shape<_4, _2>>, Stride<Stride<_256,_1,_16>,Stride<_64,_8>>>;
     using BLayout = GMMA::ABLayout<64, 16>;  // 注意：这里应该是 16，对应 K=16
     using CLayout = GMMA::CLayout_64x64;
 

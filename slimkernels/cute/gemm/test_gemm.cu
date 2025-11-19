@@ -174,7 +174,7 @@ int main() {
     };
     
     for (const auto& [M, K, N] : test_cases) {
-        benchmark_gemm(M, K, N, 50);
+        benchmark_gemm(M, K, N, 1);
         std::cout << std::endl;
     }
     

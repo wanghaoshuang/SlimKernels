@@ -210,6 +210,11 @@ __global__ void GEMM_MMA(MMAarguments arg){
   auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
   auto tAsA = s2r_thr_copy_a.partition_S(sA);  // ? (CPY, CPY_M, CPY_K, kStage)
   auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // ? (CPY, CPY_M, CPY_K)
+  if(thread0()) {
+    print("sA: "); print(sA); print("\n");
+    print("tAsA: "); print(tAsA); print("\n");
+    print("tCrA_view: "); print(tCrA_view); print("\n");
+  }
 
   auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
   auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
