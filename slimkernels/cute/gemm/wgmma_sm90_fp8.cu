@@ -172,7 +172,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // Clear the accumulators
   clear(tCrC);
 
-#if 0
+#if 1
   if(thread0()) {
     print("  mA : "); print(  mA); print("\n");
     print("  gA : "); print(  gA); print("\n");
@@ -202,7 +202,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 #endif
 
 
-#if 1
+#if 0
   // Total number of k-tiles
   auto K_TILE_MAX  = size<3>(tAgA);
   // Number of pipelined k-tiles in smem
@@ -426,7 +426,7 @@ int main(int argc, char** argv)
 
   double gflops = (2.0*m*n*k) * 1e-9;
 
-  const int timing_iterations = 100;
+  const int timing_iterations = 0;
   GPU_Clock timer;
 
   int ldA = k, ldB = k, ldC = m;

@@ -43,6 +43,7 @@
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
 #include "../atom/mma_traits_sm90_gmma.hpp"
+#include "../algorithm/gemm.hpp"
 
 using namespace cute;
 
@@ -156,8 +157,9 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              // MMA_M
   CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              // MMA_N
   CUTE_STATIC_ASSERT_V((size<2>(tCsA) == size<2>(tCsB)));              // MMA_K
+#endif
 
-
+#if 0
 
   if(thread0()) {
     print("******************A Matrix*********************\n");
@@ -176,6 +178,7 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     print("recast_tensor : "); print(recast_tensor); print("\n");
   }
 #endif
+
 #if 0
   if(thread0()) {
     print("******************B Matrix*********************\n");
@@ -199,7 +202,7 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
 #endif
 
 
-#if 0
+#if 1
   // Total number of k-tiles
   auto K_TILE_MAX  = size<3>(tAgA);
   // Number of pipelined k-tiles in smem
@@ -235,26 +238,25 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
 
     // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
-    cp_async_wait<0>();
+    cp_async_wait<K_PIPE_MAX-1>();
     copy(s2r_atom_a, tXsA(_,_,_, k_pipe_read), tXrA);
-    warpgroup_fence_operand(tCrC);
-    warpgroup_fence_operand(tCrA);
-
     warpgroup_arrive(); // wgmma.fence.sync.aligned;
     auto tCrB_k = tCrB(_,_,_,k_pipe_read);
     auto tCrB_reshaped = make_tensor(
       tCrB_k.data(),
       make_layout(
-          Shape<_2, _2, _2, Shape<_1, _3>>{},
-          Stride<_512, _64, _256, Stride<_0, _1024>>{}
+          Shape<_2, _1, _2>{},
+          Stride<_256, _64, _128>{}
       )
     );
+    warpgroup_fence_operand(tCrC);
+    warpgroup_fence_operand(tCrA);
     cute::gemm(mma, tCrA, tCrB_reshaped, tCrC);
     warpgroup_commit_batch(); // wgmma.commit_group.sync.aligned;
     // Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
-    warpgroup_wait<0>(); // wgmma.wait_group.sync.aligned %0
+    warpgroup_wait<K_PIPE_MAX-1>(); // wgmma.wait_group.sync.aligned %0
     warpgroup_fence_operand(tCrC);
-    warpgroup_fence_operand(tCrA);
+    // warpgroup_fence_operand(tCrA);
 
     // Advance k_pipe_read
     ++k_pipe_read;
@@ -284,21 +286,25 @@ gemm_tn(int m, int n, int a_k, int b_k,
         cudaStream_t stream = 0)
 {
   auto prob_shape = make_shape(m, a_k, n, b_k);                     // (M, A_K, N, B_K)
-  auto a_cta_tiler = make_shape(_128{}, _128{}, _32{});                   // (BLK_M, BLK_N, BLK_K)
-  auto b_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
-  auto c_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N)
+  // auto a_cta_tiler = make_shape(_128{}, _128{}, _32{});                   // (BLK_M, BLK_N, BLK_K)
+  // auto b_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
+  // auto c_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N)
+
+  auto a_cta_tiler = make_shape(_64{}, _64{}, _32{});                   // (BLK_M, BLK_N, BLK_K)
+  auto b_cta_tiler = make_shape(_64{}, _64{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
+  auto c_cta_tiler = make_shape(_64{}, _64{}, _128{});                   // (BLK_M, BLK_N)
 
   // Define TN strides (mixed)
   auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
   auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  auto bP = Int<3>{};  // Pipeline
+  auto bP = Int<2>{};  // Pipeline
 
   // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{}, make_shape(size<0>(a_cta_tiler),size<2>(a_cta_tiler),bP));
   auto sB = tile_to_shape(GMMA::Layout_K_INTER_Atom<TB>{}, make_shape(size<1>(b_cta_tiler),size<2>(b_cta_tiler),bP));
-  size_t smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
+  int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
 
   // Define the thread layouts (static)
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
