@@ -13,6 +13,26 @@
 namespace cute {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+
+namespace SM90::GMMA {
+///////////////////////////////////////////
+// Common layouts for GMMA Shared Memory //
+///////////////////////////////////////////
+// K-major GMMA layouts in units of bits
+using Layout_K_SW32_Atom_Bits_A   = ComposedLayout<Swizzle<3,3,4>, smem_ptr_flag, Layout<Shape<_8, _128>,Stride< _128,_1>>>;
+// K-major layouts in units of Type
+template <class Type>
+using Layout_K_SW32_Atom_A  = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW32_Atom_Bits_A{}));
+
+using Layout_K_SW128_Atom_Bits_B   = ComposedLayout<Swizzle<2,4,3>, smem_ptr_flag, Layout<Shape<_8, _512>,Stride< _512,_1>>>;
+template <class Type>
+using Layout_K_SW128_Atom_B  = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits_B{}));
+
+}
+
+
+
 // Tag types to distinguish different configurations
 struct Tag_K16 {};
 struct Tag_K64 {};

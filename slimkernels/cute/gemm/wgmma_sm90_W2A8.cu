@@ -76,13 +76,15 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));                     // NumThreads
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));                     // NumThreads
 
-  //
-  // Full and Tiled Tensors
-  //
+  // Represent the full tensors
+  auto gA_layout = tile_to_shape(Layout<Shape<_64, _16>,Stride<_16,_1>>{}, select<0,1>(shape_MNK));
+  Tensor mA = make_tensor(make_gmem_ptr(A), gA_layout);
+  auto gB_layout = tile_to_shape(Layout<Shape<_64, _64>,Stride<_64,_1>>{}, select<2,3>(shape_MNK));
+  Tensor mB = make_tensor(make_gmem_ptr(B), gB_layout); 
 
   // Represent the full tensors
-  Tensor mA = make_tensor(make_gmem_ptr(A), select<0,1>(shape_MNK), dA); // (M,K)
-  Tensor mB = make_tensor(make_gmem_ptr(B), select<2,3>(shape_MNK), dB); // (N,K)
+  // Tensor mA = make_tensor(make_gmem_ptr(A), select<0,1>(shape_MNK), dA); // (M,K)
+  // Tensor mB = make_tensor(make_gmem_ptr(B), select<2,3>(shape_MNK), dB); // (N,K)
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0,2>(shape_MNK), dC); // (M,N)
 
   // Get the appropriate blocks for this thread block
@@ -200,18 +202,22 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   }
 
 #endif
-
+// copy(copy_b, tBgB(_,_,_,0), tBsB(_,_,_,0));
+// copy(copy_a, tAgA(_,_,_,0), tAsA(_,_,_,0));
+// cp_async_fence();
+// cp_async_wait<0>();
 
 #if 1
   // Total number of k-tiles
   auto K_TILE_MAX  = size<3>(tAgA);
   // Number of pipelined k-tiles in smem
   auto K_PIPE_MAX  = size<3>(tAsA);
+
   // Prefetch all but the last
   CUTE_UNROLL
   for (int k = 0; k < K_PIPE_MAX-1; ++k)
   {
-    copy(copy_a, tAgA(_,_,_,k), tAsA(_,_,_,k));
+    // copy(copy_a, tAgA(_,_,_,k), tAsA(_,_,_,k));
     copy(copy_b, tBgB(_,_,_,k), tBsB(_,_,_,k));
     cp_async_fence(); // cp.async.commit_group;
   }
@@ -223,6 +229,14 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
 
   int k_pipe_read  = 0;
   int k_pipe_write = K_PIPE_MAX-1;
+
+  auto tCrB_reshaped = make_tensor(
+    tCrB.data(),
+    make_layout(
+        make_shape(_2{}, _1{}, _1{}, K_PIPE_MAX),  // 添加 pipeline 维度
+        make_stride(_128{}, _0{}, _0{}, _256{})
+    )
+  );
 
   CUTE_NO_UNROLL
   for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile)
@@ -241,22 +255,15 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     cp_async_wait<K_PIPE_MAX-1>();
     copy(s2r_atom_a, tXsA(_,_,_, k_pipe_read), tXrA);
     warpgroup_arrive(); // wgmma.fence.sync.aligned;
-    auto tCrB_k = tCrB(_,_,_,k_pipe_read);
-    auto tCrB_reshaped = make_tensor(
-      tCrB_k.data(),
-      make_layout(
-          Shape<_2, _1, _2>{},
-          Stride<_256, _64, _128>{}
-      )
-    );
+    auto tCrB_k = tCrB_reshaped(_,_,_,k_pipe_read);
     warpgroup_fence_operand(tCrC);
     warpgroup_fence_operand(tCrA);
-    cute::gemm(mma, tCrA, tCrB_reshaped, tCrC);
+    cute::gemm(mma, tCrA, tCrB_k, tCrC);
     warpgroup_commit_batch(); // wgmma.commit_group.sync.aligned;
     // Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
     warpgroup_wait<K_PIPE_MAX-1>(); // wgmma.wait_group.sync.aligned %0
     warpgroup_fence_operand(tCrC);
-    // warpgroup_fence_operand(tCrA);
+    warpgroup_fence_operand(tCrA);
 
     // Advance k_pipe_read
     ++k_pipe_read;
@@ -290,9 +297,9 @@ gemm_tn(int m, int n, int a_k, int b_k,
   // auto b_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
   // auto c_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N)
 
-  auto a_cta_tiler = make_shape(_64{}, _64{}, _32{});                   // (BLK_M, BLK_N, BLK_K)
-  auto b_cta_tiler = make_shape(_64{}, _64{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
-  auto c_cta_tiler = make_shape(_64{}, _64{}, _128{});                   // (BLK_M, BLK_N)
+  auto a_cta_tiler = make_shape(_64{}, _64{}, _16{});                   // (BLK_M, BLK_N, BLK_K)
+  auto b_cta_tiler = make_shape(_64{}, _64{}, _64{});                   // (BLK_M, BLK_N, BLK_K)
+  auto c_cta_tiler = make_shape(_64{}, _64{}, _64{});                   // (BLK_M, BLK_N)
 
   // Define TN strides (mixed)
   auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
@@ -303,16 +310,20 @@ gemm_tn(int m, int n, int a_k, int b_k,
 
   // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{}, make_shape(size<0>(a_cta_tiler),size<2>(a_cta_tiler),bP));
-  auto sB = tile_to_shape(GMMA::Layout_K_INTER_Atom<TB>{}, make_shape(size<1>(b_cta_tiler),size<2>(b_cta_tiler),bP));
+  auto sB = tile_to_shape(GMMA::Layout_K_SW64_Atom<TB>{}, make_shape(size<1>(b_cta_tiler),size<2>(b_cta_tiler),bP));
   int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
 
   // Define the thread layouts (static)
-  TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
-                                    Layout<Shape<_64,_2>,Stride<_2,_1>>{}, // Thr layout 16x8 k-major
-                                    Layout<Shape< _1,_16>>{});              // Val layout  1x8
+  TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint64_t>, TA>{},
+                                    Layout<Shape<_64,_2>,Stride<_2,_1>>{}, 
+                                    Layout<Shape< _1,_8>>{});
   TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
-                                    Layout<Shape<_32,_4>,Stride<_4,_1>>{}, // Thr layout 16x8 k-major
-                                    Layout<Shape< _1,_16>>{});              // Val layout  1x8
+                                    Layout<Shape<_32,_4>,Stride<_4,_1>>{},
+                                    Layout<Shape< _1,_16>>{});
+
+  // TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
+  //                                   Layout<Shape<_32,_4>,Stride<_1,_32>>{},
+  //                                   Layout<Shape< _1,_16>>{});
 
   Copy_Atom<SM75_U32x2_LDSM_N, TA> s2r_atom_a;
   // Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, TA> s2r_atom_a;
@@ -395,10 +406,10 @@ int main(int argc, char** argv)
   int b_k = 4096;
   int a_k = 4096/4;
 
-  // int m = 512;
-  // int n = 512;
-  // int a_k = 128;
-  // int b_k = 512;
+  // int m = 1024;
+  // int n = 1024;
+  // int a_k = 16*2;
+  // int b_k = 64*2;
 
   using TA = cute::uint8_t;
   using TB = cute::float_e4m3_t;
