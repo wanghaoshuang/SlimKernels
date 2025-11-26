@@ -45,6 +45,7 @@
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
 #include "cutlass/arch/mma_sm90.h"
+#include "cutlass/arch/reg_reconfig.h"
 #include "cutlass/device_kernel.h"
 #include "../atom/mma_traits_sm90_gmma.hpp"
 #include "../algorithm/gemm.hpp"
@@ -64,13 +65,21 @@ struct SharedStorage
   uint64_t mma_barrier[size<2>(SmemLayoutA{})];
 };
 
+// SM90 Register Configuration:
+// - Producer (1 warp, 32 threads): 40 registers each = 1,280 total
+// - Consumer (4 warps, 128 threads): 232 registers each = 29,696 total
+// - Total per block: 30,976 registers
+// - SM90 has 65,536 registers per SM -> allows ~2 blocks per SM
+constexpr int ProducerRegCount = 40;
+constexpr int ConsumerRegCount = 232;
+
 template <class ProblemShape, class ACtaTiler, class BCtaTiler, class CCtaTiler,
           class TA, class ASmemLayout, class TmaA, class S2RAtomA,
           class TB, class BSmemLayout, class TmaB,
           class TC, class CStride, class TiledMma, class TiledMmaA,
           class Alpha, class Beta>
 __global__ static
-__launch_bounds__(decltype(size(TiledMma{}))::value)
+__launch_bounds__(160, 2)  // 5 warps: 1 producer + 4 consumers, target 2 blocks/SM
 void
 gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler, CCtaTiler c_cta_tiler,
             TA const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a, S2RAtomA s2r_atom_a,
@@ -126,16 +135,34 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   // Define A/B partitioning and C accumulators
   //
 
-  ThrMMA thr_mma_a = mma_a.get_slice(threadIdx.x);
+  // Producer: warp 4 (threads 128-159), Consumer: warps 0-3 (threads 0-127)
+  bool is_producer = (threadIdx.x >= 128);
+  bool is_consumer = (threadIdx.x < 128);
+  
+  // SM90 Dynamic Register Reallocation:
+  // - Producer warp reduces to 40 registers (only needs TMA operations)
+  // - Consumer warp group increases to 232 registers (needs WGMMA accumulators)
+  if (is_producer) {
+    cutlass::arch::warpgroup_reg_dealloc<ProducerRegCount>();
+  } else {
+    cutlass::arch::warpgroup_reg_alloc<ConsumerRegCount>();
+  }
+  
+  // MMA thread index for consumers (0-127 mapping from threads 0-127)
+  int mma_thread_idx = threadIdx.x;
+
+  // Consumer threads participate in MMA operations
+  // Use mma_thread_idx to get correct MMA slice for consumer threads
+  ThrMMA thr_mma_a = mma_a.get_slice(is_consumer ? mma_thread_idx : 0);
   Tensor tCsA = thr_mma_a.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE)
   Tensor tCrA = thr_mma_a.partition_fragment_A(sA(_,_,0));               // (MMA,MMA_M,MMA_K)
   
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma_a);
-  ThrCopy   s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
+  ThrCopy   s2r_thr_copy_a = s2r_copy_a.get_slice(is_consumer ? mma_thread_idx : 0);
   Tensor tXsA = s2r_thr_copy_a.partition_S(sA);                        // (CPY,MMA_M,MMA_K,PIPE)
   Tensor tXrA = s2r_thr_copy_a.retile_D(tCrA);                         // (CPY,MMA_M,MMA_K)
 
-  ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+  ThrMMA thr_mma = mma.get_slice(is_consumer ? mma_thread_idx : 0);
   Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
 
@@ -143,8 +170,10 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
 
-  // Clear the accumulators
-  clear(tCrC);
+  // Clear the accumulators (only consumers need this)
+  if (is_consumer) {
+    clear(tCrC);
+  }
 
 #if 0
   if(thread0()) {
@@ -195,7 +224,7 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   int k_tile = 0;
 
   // Initialize Barriers
-  int warp_idx = cutlass::canonical_warp_idx_sync();
+  // Producer warp is warp 0, use lane_predicate to elect one thread
   int lane_predicate = cute::elect_one_sync();
   uint64_t* producer_mbar = smem.tma_barrier;
   uint64_t* consumer_mbar = smem.mma_barrier;
@@ -204,9 +233,10 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
   CUTE_UNROLL
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
-    if ((warp_idx == 0) && lane_predicate) {
+    // Producer warp (warp 0) initializes barriers
+    if (is_producer && lane_predicate) {
       ProducerBarType::init(&producer_mbar[pipe],   1);
-      ConsumerBarType::init(&consumer_mbar[pipe], 128);
+      ConsumerBarType::init(&consumer_mbar[pipe], 128);  // 4 consumer warps = 128 threads
     }
   }
   // Ensure barrier init is complete on all CTAs
@@ -215,11 +245,11 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   // Total number of k-tiles
   int k_tile_max = size<1>(tAgA);
 
-  // Start async loads for valid pipes only
+  // Start async loads for valid pipes only (producer warp only)
   CUTE_UNROLL
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
   {
-    if ((warp_idx == 0) && lane_predicate)
+    if (is_producer && lane_predicate)
     {
       if (k_tile < k_tile_max) {
         // Set expected Tx Bytes and issue TMA
@@ -235,7 +265,6 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     ++k_tile;
   }
 
-  
 
   //
   // PIPELINED MAIN LOOP
@@ -243,8 +272,8 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
 
   // A PipelineState is a circular pipe index [.index()] and a pipe phase [.phase()]
   //   that flips each cycle through K_PIPE_MAX.
-  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes
-  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA  reads
+  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes (producer)
+  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA reads (consumer)
   auto tCrB_reshaped = make_tensor(
     tCrB.data(),
     make_layout(
@@ -252,48 +281,59 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
         make_stride(_2{}, _0{}, _0{}, _256{})
     )
   );
-  CUTE_NO_UNROLL
-  while (k_tile_count > -K_PIPE_MAX)
-  {
-    
-    // Wait for Producer to complete
-    int read_pipe = read_state.index();
-    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
-    // Copy A from shared memory to registers
-    copy(s2r_copy_a, tXsA(_,_,_,read_pipe), tXrA);
-    // MMAs to cover 1 K_TILE
-    warpgroup_arrive();
-    warpgroup_fence_operand(tCrC);
-    warpgroup_fence_operand(tCrA);
-    auto tCrB_k = tCrB_reshaped(_,_,_,read_pipe);
-    cute::gemm(mma, tCrA, tCrB_k, tCrC);     // (V,M) x (V,N) => (V,M,N)
-    warpgroup_commit_batch();
-    // Wait for all MMAs in a K_TILE to complete
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(tCrC);
-    
-    // Notify that consumption is done
-    ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
-    ++read_state;
-
-    if ((warp_idx == 0) && lane_predicate)
+  
+  // Producer warp (warp 0) - only does TMA loading
+  if (is_producer) {
+    CUTE_NO_UNROLL
+    while (k_tile_count > -K_PIPE_MAX)
     {
-      int pipe = write_state.index();
-      // Wait for Consumer to complete consumption
-      ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
-      // Set expected Tx Bytes after each reset / init
-      if (k_tile < k_tile_max) {
-        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
-      } else {
-        // No more tiles - expect 0 bytes so barrier completes immediately
-        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
+      if (lane_predicate)
+      {
+        int pipe = write_state.index();
+        // Wait for Consumer to complete consumption
+        ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+        // Set expected Tx Bytes after each reset / init
+        if (k_tile < k_tile_max) {
+          ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+          copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+          copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+        } else {
+          // No more tiles - expect 0 bytes so barrier completes immediately
+          ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
+        }
+        ++write_state;
       }
-      ++write_state;
+      --k_tile_count;
+      ++k_tile;
     }
-    --k_tile_count;
-    ++k_tile;
+  }
+  // Consumer warps (warps 1-4) - only do WGMMA computation
+  else {
+    CUTE_NO_UNROLL
+    while (k_tile_count > -K_PIPE_MAX)
+    {
+      // Wait for Producer to complete
+      int read_pipe = read_state.index();
+      ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+      // Copy A from shared memory to registers
+      copy(s2r_copy_a, tXsA(_,_,_,read_pipe), tXrA);
+      // MMAs to cover 1 K_TILE
+      warpgroup_arrive();
+      // warpgroup_fence_operand(tCrC);
+      // warpgroup_fence_operand(tCrA);
+      auto tCrB_k = tCrB_reshaped(_,_,_,read_pipe);
+      cute::gemm(mma, tCrA, tCrB_k, tCrC);     // (V,M) x (V,N) => (V,M,N)
+      warpgroup_commit_batch();
+      // Wait for all MMAs in a K_TILE to complete
+      warpgroup_wait<0>();
+      // warpgroup_fence_operand(tCrC);
+      // Notify that consumption is done
+      ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+      ++read_state;
+
+      --k_tile_count;
+      ++k_tile;
+    }
   }
 
   //
@@ -332,7 +372,7 @@ gemm_tn(int m, int n, int a_k, int b_k,
   auto bN = Int<64>{};
   auto bKA = Int<16>{};
   auto bKB = Int<64>{};
-  auto bP = Int<1>{};  // Pipeline
+  auto bP = Int<3>{};  // Pipeline
 
   // Define the smem layouts (static)
   auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{}, make_shape(bM, bKA, bP));
@@ -364,7 +404,8 @@ gemm_tn(int m, int n, int a_k, int b_k,
   //
 
   // Launch parameter setup
-  dim3 dimBlock(size(tiled_mma));
+  // 5 warps: 1 producer (TMA) + 4 consumers (WGMMA)
+  dim3 dimBlock(160);
   dim3 dimCluster(1, 1, 1);
   dim3 dimGrid(round_up(size(ceil_div(m, size<0>(c_cta_tiler))), dimCluster.x),
                round_up(size(ceil_div(n, size<1>(c_cta_tiler))), dimCluster.y));
