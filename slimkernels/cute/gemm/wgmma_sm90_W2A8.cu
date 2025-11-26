@@ -38,10 +38,14 @@
 #include <cute/tensor.hpp>
 
 #include "cutlass/cluster_launch.hpp"
+#include "cutlass/arch/barrier.h"
+#include "cutlass/pipeline/sm90_pipeline.hpp"
 
 #include "cutlass/util/print_error.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
+#include "cutlass/arch/mma_sm90.h"
+#include "cutlass/device_kernel.h"
 #include "../atom/mma_traits_sm90_gmma.hpp"
 #include "../algorithm/gemm.hpp"
 
@@ -55,43 +59,46 @@ struct SharedStorage
 {
   alignas(128) cute::ArrayEngine<ElementA, cosize_v<SmemLayoutA>> A;
   alignas(128) cute::ArrayEngine<ElementB, cosize_v<SmemLayoutB>> B;
+
+  uint64_t tma_barrier[size<2>(SmemLayoutA{})];
+  uint64_t mma_barrier[size<2>(SmemLayoutA{})];
 };
 
-template <class ProblemShape, class ACtaTiler,class BCtaTiler,class CCtaTiler,
-          class TA, class AStride, class ASmemLayout, class TiledCopyA, class S2RAtomA,
-          class TB, class BStride, class BSmemLayout, class TiledCopyB,
+template <class ProblemShape, class ACtaTiler, class BCtaTiler, class CCtaTiler,
+          class TA, class ASmemLayout, class TmaA, class S2RAtomA,
+          class TB, class BSmemLayout, class TmaB,
           class TC, class CStride, class TiledMma, class TiledMmaA,
           class Alpha, class Beta>
 __global__ static
 __launch_bounds__(decltype(size(TiledMma{}))::value)
 void
 gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler, CCtaTiler c_cta_tiler,
-            TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
-            TB const* B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b,
+            TA const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a, S2RAtomA s2r_atom_a,
+            TB const* B, CUTLASS_GRID_CONSTANT TmaB const tma_b,
             TC      * C, CStride dC, TiledMma mma, TiledMmaA mma_a,
             Alpha alpha, Beta beta)
 {
   // Preconditions
+  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<4>{});                   // (M, A_K, N, B_K)
 
-  CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));                     // NumThreads
-  CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));                     // NumThreads
+  static_assert(is_static<ASmemLayout>::value);
+  static_assert(is_static<BSmemLayout>::value);
+
+  //
+  // Full and Tiled Tensors
+  //
 
   // Represent the full tensors
-  auto gA_layout = tile_to_shape(Layout<Shape<_64, _16>,Stride<_16,_1>>{}, select<0,1>(shape_MNK));
-  Tensor mA = make_tensor(make_gmem_ptr(A), gA_layout);
-  auto gB_layout = tile_to_shape(Layout<Shape<_64, _64>,Stride<_64,_1>>{}, select<2,3>(shape_MNK));
-  Tensor mB = make_tensor(make_gmem_ptr(B), gB_layout); 
-
-  // Represent the full tensors
-  // Tensor mA = make_tensor(make_gmem_ptr(A), select<0,1>(shape_MNK), dA); // (M,K)
-  // Tensor mB = make_tensor(make_gmem_ptr(B), select<2,3>(shape_MNK), dB); // (N,K)
-  Tensor mC = make_tensor(make_gmem_ptr(C), select<0,2>(shape_MNK), dC); // (M,N)
+  auto [M, A_K, N, B_K] = shape_MNK;
+  Tensor mA = tma_a.get_tma_tensor(make_shape(M, A_K));               // (M, A_K) TMA Tensor
+  Tensor mB = tma_b.get_tma_tensor(make_shape(N, B_K));               // (N, B_K) TMA Tensor
+  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), dC);    // (M, N)
 
   // Get the appropriate blocks for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
-  Tensor gA = local_tile(mA, a_cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, b_cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, c_cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+  Tensor gA = local_tile(mA, a_cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(mB, b_cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(mC, c_cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
 
   // Shared memory tensors
   extern __shared__ char shared_memory[];
@@ -101,34 +108,20 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), BSmemLayout{}); // (BLK_N,BLK_K,PIPE)
 
   //
-  // Partition the copying of A and B tiles across the threads
+  // Partition the copying of A and B tiles using TMA
   //
 
-  ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
-  Tensor tAgA = thr_copy_a.partition_S(gA);                            // (CPY,CPY_M,CPY_K,k)
-  Tensor sA_ = as_position_independent_swizzle_tensor(sA);
-  Tensor tAsA = thr_copy_a.partition_D(sA_);                           // (CPY,CPY_M,CPY_K,PIPE)
-#if 0
-  if(thread0()) {
-    print("gA : "); print(gA); print("\n");
-    print("tAgA : "); print(tAgA); print("\n");
-    print("thr_copy_a : "); print(thr_copy_a); print("\n");
-    print("copy_a : "); print(copy_a); print("\n");
-  }
-#endif
+  auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,2>(sA), group_modes<0,2>(gA));  // (TMA,k) and (TMA,PIPE)
 
+  auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,2>(sB), group_modes<0,2>(gB));  // (TMA,k) and (TMA,PIPE)
 
-  ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
-  Tensor tBgB = thr_copy_b.partition_S(gB);                            // (CPY,CPY_N,CPY_K,k)
-  Tensor sB_ = as_position_independent_swizzle_tensor(sB);
-  Tensor tBsB = thr_copy_b.partition_D(sB_);                           // (CPY,CPY_N,CPY_K,PIPE)
+  // The TMA is responsible for copying everything in mode-0 of tAsA and tBsB
+  constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
+                                      + sizeof(make_tensor_like(tensor<0>(tBsB)));
 
-  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));                // CPY_M
-  CUTE_STATIC_ASSERT_V(size<2>(tAgA) == size<2>(tAsA));                // CPY_K
-  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB));                // CPY_N
-  CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBsB));                // CPY_K
-
-
+  
   //
   // Define A/B partitioning and C accumulators
   //
@@ -140,10 +133,7 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma_a);
   ThrCopy   s2r_thr_copy_a = s2r_copy_a.get_slice(threadIdx.x);
   Tensor tXsA = s2r_thr_copy_a.partition_S(sA);                        // (CPY,MMA_M,MMA_K,PIPE)
-  // Tensor tXrA = s2r_thr_copy_a.partition_D(sA(_,_,0));
   Tensor tXrA = s2r_thr_copy_a.retile_D(tCrA);                         // (CPY,MMA_M,MMA_K)
-
-  Tensor recast_tensor = recast<uint128_t>(tXsA);
 
   ThrMMA thr_mma = mma.get_slice(threadIdx.x);
   Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
@@ -153,16 +143,10 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
 
-  
+  // Clear the accumulators
+  clear(tCrC);
 
 #if 0
-  CUTE_STATIC_ASSERT_V((size<1>(tCgC) == size<1>(tCsA)));              // MMA_M
-  CUTE_STATIC_ASSERT_V((size<2>(tCgC) == size<1>(tCsB)));              // MMA_N
-  CUTE_STATIC_ASSERT_V((size<2>(tCsA) == size<2>(tCsB)));              // MMA_K
-#endif
-
-#if 0
-
   if(thread0()) {
     print("******************A Matrix*********************\n");
     print("  s2r_atom_a : "); print(  s2r_atom_a); print("\n");
@@ -177,11 +161,8 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     print("tCrA : "); print(tCrA); print("\n");
     print("tXsA : "); print(tXsA); print("\n");
     print("tXrA : "); print(tXrA); print("\n");
-    print("recast_tensor : "); print(recast_tensor); print("\n");
   }
-#endif
 
-#if 0
   if(thread0()) {
     print("******************B Matrix*********************\n");
     print("  mB : "); print(  mB); print("\n");
@@ -200,83 +181,127 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     print("tCgC : "); print(tCgC); print("\n");
     print("tCrC : "); print(tCrC); print("\n");
   }
-
 #endif
-// copy(copy_b, tBgB(_,_,_,0), tBsB(_,_,_,0));
-// copy(copy_a, tAgA(_,_,_,0), tAsA(_,_,_,0));
-// cp_async_fence();
-// cp_async_wait<0>();
-
+  
 #if 1
-  // Total number of k-tiles
-  auto K_TILE_MAX  = size<3>(tAgA);
-  // Number of pipelined k-tiles in smem
-  auto K_PIPE_MAX  = size<3>(tAsA);
+  //
+  // PREFETCH
+  //
 
-  // Prefetch all but the last
+  auto K_PIPE_MAX = size<1>(tAsA);
+  // Total count of tiles (use A's k-tile count as main loop count)
+  int k_tile_count = size<1>(tAgA);
+  // Current tile index in gmem to read from
+  int k_tile = 0;
+
+  // Initialize Barriers
+  int warp_idx = cutlass::canonical_warp_idx_sync();
+  int lane_predicate = cute::elect_one_sync();
+  uint64_t* producer_mbar = smem.tma_barrier;
+  uint64_t* consumer_mbar = smem.mma_barrier;
+
+  using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;  // TMA
+  using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
   CUTE_UNROLL
-  for (int k = 0; k < K_PIPE_MAX-1; ++k)
+  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+    if ((warp_idx == 0) && lane_predicate) {
+      ProducerBarType::init(&producer_mbar[pipe],   1);
+      ConsumerBarType::init(&consumer_mbar[pipe], 128);
+    }
+  }
+  // Ensure barrier init is complete on all CTAs
+  cluster_sync();
+
+  // Total number of k-tiles
+  int k_tile_max = size<1>(tAgA);
+
+  // Start async loads for valid pipes only
+  CUTE_UNROLL
+  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
   {
-    // copy(copy_a, tAgA(_,_,_,k), tAsA(_,_,_,k));
-    copy(copy_b, tBgB(_,_,_,k), tBsB(_,_,_,k));
-    cp_async_fence(); // cp.async.commit_group;
+    if ((warp_idx == 0) && lane_predicate)
+    {
+      if (k_tile < k_tile_max) {
+        // Set expected Tx Bytes and issue TMA
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+      } else {
+        // No more tiles - expect 0 bytes so barrier completes immediately
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
+      }
+    }
+    --k_tile_count;
+    ++k_tile;
   }
 
-  // Clear the accumulators
-  clear(tCrC);
+  
 
-  __syncthreads();
+  //
+  // PIPELINED MAIN LOOP
+  //
 
-  int k_pipe_read  = 0;
-  int k_pipe_write = K_PIPE_MAX-1;
-
+  // A PipelineState is a circular pipe index [.index()] and a pipe phase [.phase()]
+  //   that flips each cycle through K_PIPE_MAX.
+  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes
+  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA  reads
   auto tCrB_reshaped = make_tensor(
     tCrB.data(),
     make_layout(
         make_shape(_2{}, _1{}, _1{}, K_PIPE_MAX),  // 添加 pipeline 维度
-        make_stride(_128{}, _0{}, _0{}, _256{})
+        make_stride(_2{}, _0{}, _0{}, _256{})
     )
   );
-
   CUTE_NO_UNROLL
-  for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile)
+  while (k_tile_count > -K_PIPE_MAX)
   {
-    int k_tile_next = k_tile + (K_PIPE_MAX-1);
-    k_tile_next = (k_tile_next >= K_TILE_MAX) ? K_TILE_MAX-1 : k_tile_next; 
-
-    copy(copy_a, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,k_pipe_write));
-    copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,k_pipe_write));
-    cp_async_fence(); // cp.async.commit_group;
-    // Advance k_pipe_write
-    ++k_pipe_write;
-    k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
-
-    // Wait on all cp.async -- optimize by pipelining to overlap GMEM reads
-    cp_async_wait<K_PIPE_MAX-1>();
-    copy(s2r_atom_a, tXsA(_,_,_, k_pipe_read), tXrA);
-    warpgroup_arrive(); // wgmma.fence.sync.aligned;
-    auto tCrB_k = tCrB_reshaped(_,_,_,k_pipe_read);
+    
+    // Wait for Producer to complete
+    int read_pipe = read_state.index();
+    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+    // Copy A from shared memory to registers
+    copy(s2r_copy_a, tXsA(_,_,_,read_pipe), tXrA);
+    // MMAs to cover 1 K_TILE
+    warpgroup_arrive();
     warpgroup_fence_operand(tCrC);
     warpgroup_fence_operand(tCrA);
-    cute::gemm(mma, tCrA, tCrB_k, tCrC);
-    warpgroup_commit_batch(); // wgmma.commit_group.sync.aligned;
-    // Wait on the GMMA barrier for K_PIPE_MMAS (or fewer) outstanding to ensure smem_pipe_write is consumed
-    warpgroup_wait<K_PIPE_MAX-1>(); // wgmma.wait_group.sync.aligned %0
+    auto tCrB_k = tCrB_reshaped(_,_,_,read_pipe);
+    cute::gemm(mma, tCrA, tCrB_k, tCrC);     // (V,M) x (V,N) => (V,M,N)
+    warpgroup_commit_batch();
+    // Wait for all MMAs in a K_TILE to complete
+    warpgroup_wait<0>();
     warpgroup_fence_operand(tCrC);
-    warpgroup_fence_operand(tCrA);
+    
+    // Notify that consumption is done
+    ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+    ++read_state;
 
-    // Advance k_pipe_read
-    ++k_pipe_read;
-    k_pipe_read = (k_pipe_read == K_PIPE_MAX) ? 0 : k_pipe_read;
+    if ((warp_idx == 0) && lane_predicate)
+    {
+      int pipe = write_state.index();
+      // Wait for Consumer to complete consumption
+      ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+      // Set expected Tx Bytes after each reset / init
+      if (k_tile < k_tile_max) {
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+      } else {
+        // No more tiles - expect 0 bytes so barrier completes immediately
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
+      }
+      ++write_state;
+    }
+    --k_tile_count;
+    ++k_tile;
   }
 
-#endif
-
   //
-  // Epilogue
+  // Epilogue (unpredicated)
   //
 
   // axpby(alpha, tCrC, beta, tCgC);
+#endif
 }
 
 
@@ -293,9 +318,6 @@ gemm_tn(int m, int n, int a_k, int b_k,
         cudaStream_t stream = 0)
 {
   auto prob_shape = make_shape(m, a_k, n, b_k);                     // (M, A_K, N, B_K)
-  // auto a_cta_tiler = make_shape(_128{}, _128{}, _32{});                   // (BLK_M, BLK_N, BLK_K)
-  // auto b_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N, BLK_K)
-  // auto c_cta_tiler = make_shape(_128{}, _128{}, _128{});                   // (BLK_M, BLK_N)
 
   auto a_cta_tiler = make_shape(_64{}, _64{}, _16{});                   // (BLK_M, BLK_N, BLK_K)
   auto b_cta_tiler = make_shape(_64{}, _64{}, _64{});                   // (BLK_M, BLK_N, BLK_K)
@@ -306,42 +328,35 @@ gemm_tn(int m, int n, int a_k, int b_k,
   auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
-  auto bP = Int<2>{};  // Pipeline
+  auto bM = Int<64>{};
+  auto bN = Int<64>{};
+  auto bKA = Int<16>{};
+  auto bKB = Int<64>{};
+  auto bP = Int<1>{};  // Pipeline
 
   // Define the smem layouts (static)
-  auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{}, make_shape(size<0>(a_cta_tiler),size<2>(a_cta_tiler),bP));
-  auto sB = tile_to_shape(GMMA::Layout_K_SW64_Atom<TB>{}, make_shape(size<1>(b_cta_tiler),size<2>(b_cta_tiler),bP));
+  auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{}, make_shape(bM, bKA, bP));
+  auto sB = tile_to_shape(GMMA::Layout_K_SW64_Atom<TB>{}, make_shape(bN, bKB, bP));
   int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
 
-  // Define the thread layouts (static)
-  TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint64_t>, TA>{},
-                                    Layout<Shape<_64,_2>,Stride<_2,_1>>{}, 
-                                    Layout<Shape< _1,_8>>{});
-  TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
-                                    Layout<Shape<_32,_4>,Stride<_4,_1>>{},
-                                    Layout<Shape< _1,_16>>{});
+  // Define the TMA atoms
+  Tensor mA = make_tensor(A, make_shape(m, a_k), dA);
+  Tensor mB = make_tensor(B, make_shape(n, b_k), dB);
 
-  // TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
-  //                                   Layout<Shape<_32,_4>,Stride<_1,_32>>{},
-  //                                   Layout<Shape< _1,_16>>{});
+  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM, bKA));
+  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN, bKB));
 
   Copy_Atom<SM75_U32x2_LDSM_N, TA> s2r_atom_a;
-  // Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, TA> s2r_atom_a;
   TiledMMA tiled_mma_a = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN_A<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
 
 #if 0
-  print("  copyA : "); print(  copyA); print("\n");
+  print("  tmaA : "); print(  tmaA); print("\n");
+  print("  tmaB : "); print(  tmaB); print("\n");
   print("  s2r_atom_a : "); print(  s2r_atom_a); print("\n");
-  print("  copyB : "); print(  copyB); print("\n");
   print("  tiled_mma : "); print(  tiled_mma); print("\n");
   print("  sA : "); print(  sA); print("\n");
-#endif
-
-#if 0
-  print_latex(copyA);
-  print_latex(copyB);
-  print_latex(mmaC);
+  print("  sB : "); print(  sB); print("\n");
 #endif
 
   //
@@ -357,8 +372,8 @@ gemm_tn(int m, int n, int a_k, int b_k,
 
   void const* kernel_ptr = reinterpret_cast<void const*>(
                               &gemm_device<decltype(prob_shape), decltype(a_cta_tiler), decltype(b_cta_tiler), decltype(c_cta_tiler),
-                                           TA, decltype(dA), decltype(sA), decltype(copyA), decltype(s2r_atom_a),
-                                           TB, decltype(dB), decltype(sB), decltype(copyB),
+                                           TA, decltype(sA), decltype(tmaA), decltype(s2r_atom_a),
+                                           TB, decltype(sB), decltype(tmaB),
                                            TC, decltype(dC), decltype(tiled_mma), decltype(tiled_mma_a),
                                            decltype(alpha), decltype(beta)>);
 
@@ -370,8 +385,8 @@ gemm_tn(int m, int n, int a_k, int b_k,
   // Kernel Launch
   cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
                                                              prob_shape, a_cta_tiler, b_cta_tiler, c_cta_tiler,
-                                                             A, dA, sA, copyA, s2r_atom_a,
-                                                             B, dB, sB, copyB,
+                                                             A, tmaA, s2r_atom_a,
+                                                             B, tmaB,
                                                              C, dC, tiled_mma, tiled_mma_a,
                                                              alpha, beta);
   CUTE_CHECK_LAST();
@@ -405,11 +420,11 @@ int main(int argc, char** argv)
   int n = 5120;
   int b_k = 4096;
   int a_k = 4096/4;
-
-  // int m = 1024;
-  // int n = 1024;
-  // int a_k = 16*2;
-  // int b_k = 64*2;
+  // int m = 64;
+  // int n = 64;
+  // int b_k = 64*8;
+  // int a_k = 64*8/4;
+  
 
   using TA = cute::uint8_t;
   using TB = cute::float_e4m3_t;
