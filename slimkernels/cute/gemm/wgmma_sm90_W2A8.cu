@@ -52,6 +52,65 @@
 
 using namespace cute;
 
+// ============== Debug Print Utilities ==============
+#ifdef DEBUG_MODE
+
+#define DEBUG_PRINT_VAR(var) \
+  do { if(thread0()) { print("  " #var " : "); print(var); print("\n"); } } while(0)
+
+#define DEBUG_SECTION_BEGIN(title) \
+  do { if(thread0()) { print("******************" title "*********************\n"); } } while(0)
+
+#define DEBUG_PRINT_MATRIX_A(s2r_atom_a, s2r_copy_a, s2r_thr_copy_a, mA, gA, sA, tAgA, tAsA, tCsA, tCrA, tXsA, tXrA) \
+  do { \
+    DEBUG_SECTION_BEGIN("A Matrix"); \
+    DEBUG_PRINT_VAR(s2r_atom_a); \
+    DEBUG_PRINT_VAR(s2r_copy_a); \
+    DEBUG_PRINT_VAR(s2r_thr_copy_a); \
+    DEBUG_PRINT_VAR(mA); \
+    DEBUG_PRINT_VAR(gA); \
+    DEBUG_PRINT_VAR(sA); \
+    DEBUG_PRINT_VAR(tAgA); \
+    DEBUG_PRINT_VAR(tAsA); \
+    DEBUG_PRINT_VAR(tCsA); \
+    DEBUG_PRINT_VAR(tCrA); \
+    DEBUG_PRINT_VAR(tXsA); \
+    DEBUG_PRINT_VAR(tXrA); \
+  } while(0)
+
+#define DEBUG_PRINT_MATRIX_B(mB, gB, sB, tBgB, tBsB, tCsB, tCrB) \
+  do { \
+    DEBUG_SECTION_BEGIN("B Matrix"); \
+    DEBUG_PRINT_VAR(mB); \
+    DEBUG_PRINT_VAR(gB); \
+    DEBUG_PRINT_VAR(sB); \
+    DEBUG_PRINT_VAR(tBgB); \
+    DEBUG_PRINT_VAR(tBsB); \
+    DEBUG_PRINT_VAR(tCsB); \
+    DEBUG_PRINT_VAR(tCrB); \
+  } while(0)
+
+#define DEBUG_PRINT_MATRIX_C(mC, gC, tCgC, tCrC) \
+  do { \
+    DEBUG_SECTION_BEGIN("C Matrix"); \
+    DEBUG_PRINT_VAR(mC); \
+    DEBUG_PRINT_VAR(gC); \
+    DEBUG_PRINT_VAR(tCgC); \
+    DEBUG_PRINT_VAR(tCrC); \
+  } while(0)
+
+#else  // !DEBUG_MODE
+
+#define DEBUG_PRINT_VAR(var) ((void)0)
+#define DEBUG_SECTION_BEGIN(title) ((void)0)
+#define DEBUG_PRINT_MATRIX_A(...) ((void)0)
+#define DEBUG_PRINT_MATRIX_B(...) ((void)0)
+#define DEBUG_PRINT_MATRIX_C(...) ((void)0)
+
+#endif  // DEBUG_MODE
+// ============== End Debug Print Utilities ==============
+
+
 template <class ElementA,
           class ElementB,
           class SmemLayoutA,  // (M,K,P)
@@ -64,6 +123,66 @@ struct SharedStorage
   uint64_t tma_barrier[size<2>(SmemLayoutA{})];
   uint64_t mma_barrier[size<2>(SmemLayoutA{})];
 };
+
+//
+// Global-memory packing kernels:
+// - 将 row-major 的 A、B 预先重排成与 TMA gmem layout 一致的 tile layout，
+//   使得每个 64x16 / 64x64 tile 在 gmem 中物理上连续，提高 L1TEX->L2 的 sector 利用率。
+//
+
+template <class TA>
+__global__ void
+pack_A_kernel(TA const* __restrict__ A_in,
+              int M, int A_K, int ldA,          // 原始 row-major: (M, A_K), ldA = A_K
+              TA      * __restrict__ A_packed)  // 目标: 64x16 tile layout
+{
+  using namespace cute;
+
+  // 源：row-major [M, A_K]
+  Tensor gA_src = make_tensor(make_gmem_ptr(A_in),
+                              make_shape(M, A_K),
+                              make_stride(ldA, Int<1>{}));      // (dM, dK)
+
+  // 目的：按 64x16 tile 物理布局
+  auto gA_layout =
+      tile_to_shape(Layout<Shape<_64, _16>, Stride<_16, _1>>{}, // tile 内: K 连续，行距 16B
+                    make_shape(M, A_K));                        // (M, A_K)
+  Tensor gA_dst = make_tensor(make_gmem_ptr(A_packed), gA_layout);
+
+  int m = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (m < M && k < A_K) {
+    gA_dst(m, k) = gA_src(m, k);
+  }
+}
+
+template <class TB>
+__global__ void
+pack_B_kernel(TB const* __restrict__ B_in,
+              int N, int B_K, int ldB,          // 原始 row-major: (N, B_K), ldB = B_K
+              TB      * __restrict__ B_packed)  // 目标: 64x64 tile layout
+{
+  using namespace cute;
+
+  // 源：row-major [N, B_K]
+  Tensor gB_src = make_tensor(make_gmem_ptr(B_in),
+                              make_shape(N, B_K),
+                              make_stride(ldB, Int<1>{}));      // (dN, dK)
+
+  // 目的：按 64x64 tile 物理布局
+  auto gB_layout =
+      tile_to_shape(Layout<Shape<_64, _64>, Stride<_64, _1>>{}, // tile 内: K 连续，行距 64B
+                    make_shape(N, B_K));                        // (N, B_K)
+  Tensor gB_dst = make_tensor(make_gmem_ptr(B_packed), gB_layout);
+
+  int n = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (n < N && k < B_K) {
+    gB_dst(n, k) = gB_src(n, k);
+  }
+}
 
 // SM90 Register Configuration:
 // - Producer (1 warp, 32 threads): 40 registers each = 1,280 total
@@ -99,9 +218,11 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
 
   // Represent the full tensors
   auto [M, A_K, N, B_K] = shape_MNK;
-  Tensor mA = tma_a.get_tma_tensor(make_shape(M, A_K));               // (M, A_K) TMA Tensor
-  Tensor mB = tma_b.get_tma_tensor(make_shape(N, B_K));               // (N, B_K) TMA Tensor
-  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), dC);    // (M, N)
+  auto gA_layout = tile_to_shape(Layout<Shape<_64, _16>,Stride<_16,_1>>{}, make_shape(M, A_K));
+  Tensor mA = tma_a.get_tma_tensor(gA_layout.shape()); 
+  auto gB_layout = tile_to_shape(Layout<Shape<_64, _64>,Stride<_64,_1>>{}, make_shape(N, B_K));
+  Tensor mB = tma_b.get_tma_tensor(gB_layout.shape());              
+  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), dC);
 
   // Get the appropriate blocks for this thread block
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
@@ -175,42 +296,11 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     clear(tCrC);
   }
 
-#if 0
-  if(thread0()) {
-    print("******************A Matrix*********************\n");
-    print("  s2r_atom_a : "); print(  s2r_atom_a); print("\n");
-    print("  s2r_copy_a : "); print(  s2r_copy_a); print("\n");
-    print("  s2r_thr_copy_a : "); print(  s2r_thr_copy_a); print("\n");
-    print("  mA : "); print(  mA); print("\n");
-    print("  gA : "); print(  gA); print("\n");
-    print("  sA : "); print(  sA); print("\n");
-    print("tAgA : "); print(tAgA); print("\n");
-    print("tAsA : "); print(tAsA); print("\n");
-    print("tCsA : "); print(tCsA); print("\n");
-    print("tCrA : "); print(tCrA); print("\n");
-    print("tXsA : "); print(tXsA); print("\n");
-    print("tXrA : "); print(tXrA); print("\n");
-  }
-
-  if(thread0()) {
-    print("******************B Matrix*********************\n");
-    print("  mB : "); print(  mB); print("\n");
-    print("  gB : "); print(  gB); print("\n");
-    print("  sB : "); print(  sB); print("\n");
-    print("tBgB : "); print(tBgB); print("\n");
-    print("tBsB : "); print(tBsB); print("\n");
-    print("tCsB : "); print(tCsB); print("\n");
-    print("tCrB : "); print(tCrB); print("\n");
-  }
-
-  if(thread0()) {
-    print("******************C Matrix*********************\n");
-    print("  mC : "); print(  mC); print("\n");
-    print("  gC : "); print(  gC); print("\n");
-    print("tCgC : "); print(tCgC); print("\n");
-    print("tCrC : "); print(tCrC); print("\n");
-  }
-#endif
+  // Debug print (only when compiled with -DDEBUG_MODE)
+  DEBUG_PRINT_MATRIX_A(gA_layout);
+  DEBUG_PRINT_MATRIX_A(s2r_atom_a, s2r_copy_a, s2r_thr_copy_a, mA, gA, sA, tAgA, tAsA, tCsA, tCrA, tXsA, tXrA);
+  DEBUG_PRINT_MATRIX_B(mB, gB, sB, tBgB, tBsB, tCsB, tCrB);
+  DEBUG_PRINT_MATRIX_C(mC, gC, tCgC, tCrC);
   
 #if 1
   //
@@ -364,8 +454,8 @@ gemm_tn(int m, int n, int a_k, int b_k,
   auto c_cta_tiler = make_shape(_64{}, _64{}, _64{});                   // (BLK_M, BLK_N)
 
   // Define TN strides (mixed)
-  auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
-  auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
+  // auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
+  // auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
   auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
 
   auto bM = Int<64>{};
@@ -379,29 +469,20 @@ gemm_tn(int m, int n, int a_k, int b_k,
   auto sB = tile_to_shape(GMMA::Layout_K_SW64_Atom<TB>{}, make_shape(bN, bKB, bP));
   int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
 
-  // Define the TMA atoms
-  Tensor mA = make_tensor(A, make_shape(m, a_k), dA);
-  Tensor mB = make_tensor(B, make_shape(n, b_k), dB);
 
-  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM, bKA));
-  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN, bKB));
+  // Define the TMA atoms
+  auto gA_layout = tile_to_shape(Layout<Shape<_64, _16>,Stride<_16,_1>>{}, make_shape(m, a_k));
+  Tensor mA = make_tensor(A, gA_layout);
+  auto gB_layout = tile_to_shape(Layout<Shape<_64, _64>,Stride<_64,_1>>{}, make_shape(n, b_k));
+  Tensor mB = make_tensor(B, gB_layout);
+
+  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(make_shape(bM, _1{}), make_shape(bKA, _1{})));
+  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(make_shape(bN, _1{}), make_shape(bKB, _1{})));
 
   Copy_Atom<SM75_U32x2_LDSM_N, TA> s2r_atom_a;
   TiledMMA tiled_mma_a = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN_A<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
 
-#if 0
-  print("  tmaA : "); print(  tmaA); print("\n");
-  print("  tmaB : "); print(  tmaB); print("\n");
-  print("  s2r_atom_a : "); print(  s2r_atom_a); print("\n");
-  print("  tiled_mma : "); print(  tiled_mma); print("\n");
-  print("  sA : "); print(  sA); print("\n");
-  print("  sB : "); print(  sB); print("\n");
-#endif
-
-  //
-  // Setup and Launch
-  //
 
   // Launch parameter setup
   // 5 warps: 1 producer (TMA) + 4 consumers (WGMMA)
@@ -461,11 +542,6 @@ int main(int argc, char** argv)
   int n = 5120;
   int b_k = 4096;
   int a_k = 4096/4;
-  // int m = 64;
-  // int n = 64;
-  // int b_k = 64*8;
-  // int a_k = 64*8/4;
-  
 
   using TA = cute::uint8_t;
   using TB = cute::float_e4m3_t;
@@ -489,33 +565,47 @@ int main(int argc, char** argv)
   thrust::device_vector<TC> d_C = h_C;
 
   double gflops = (2.0*m*n*b_k) * 1e-9;
-
+#ifdef DEBUG_MODE
+  const int timing_iterations = 1;
+#else
   const int timing_iterations = 100;
+#endif
+
   GPU_Clock timer;
 
   int ldA = a_k, ldB = b_k, ldC = m;
 
+  //
+  // Pre-pack A, B into gmem layouts that match the TMA gA/gB layouts:
+  // - A_packed : 64x16 tiles with Layout<Shape<_64,_16>,Stride<_16,_1>>
+  // - B_packed : 64x64 tiles with Layout<Shape<_64,_64>,Stride<_64,_1>>
+  //
+  thrust::device_vector<TA> d_A_packed(m * a_k);
+  thrust::device_vector<TB> d_B_packed(n * b_k);
 
-  // Run once
-  d_C = h_C;
-  gemm_tn(m, n, a_k, b_k,
-       alpha,
-       d_A.data().get(), ldA,
-       d_B.data().get(), ldB,
-       beta,
-       d_C.data().get(), ldC);
+  dim3 packBlock(16, 16);
+  dim3 packGridA((a_k + packBlock.x - 1) / packBlock.x,
+                 (m   + packBlock.y - 1) / packBlock.y);
+  dim3 packGridB((b_k + packBlock.x - 1) / packBlock.x,
+                 (n   + packBlock.y - 1) / packBlock.y);
+
+  pack_A_kernel<TA><<<packGridA, packBlock>>>(
+      d_A.data().get(), m, a_k, ldA,
+      d_A_packed.data().get());
+  pack_B_kernel<TB><<<packGridB, packBlock>>>(
+      d_B.data().get(), n, b_k, ldB,
+      d_B_packed.data().get());
   CUTE_CHECK_LAST();
-  thrust::host_vector<TC> cute_result = d_C;
 
-  // Timing iterations
+  d_C = h_C;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
     gemm_tn(m, n, a_k, b_k,
-         alpha,
-         d_A.data().get(), ldA,
-         d_B.data().get(), ldB,
-         beta,
-         d_C.data().get(), ldC);
+            alpha,
+            d_A_packed.data().get(), ldA,  // A now in packed 64x16 tile layout
+            d_B_packed.data().get(), ldB,  // B now in packed 64x64 tile layout
+            beta,
+            d_C.data().get(), ldC);
   }
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
