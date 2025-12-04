@@ -52,6 +52,34 @@
 
 using namespace cute;
 
+// ============== Persistent Scheduler ==============
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumSMs>
+struct PersistentScheduler {
+  int current_iter = -1;
+  uint32_t num_blocks;
+  uint32_t num_m_blocks;
+  uint32_t num_n_blocks;
+
+  __device__ __forceinline__ explicit PersistentScheduler(uint32_t shape_m, uint32_t shape_n) {
+    num_m_blocks = (shape_m + BLOCK_M - 1) / BLOCK_M;
+    num_n_blocks = (shape_n + BLOCK_N - 1) / BLOCK_N;
+    num_blocks = num_m_blocks * num_n_blocks;
+  }
+
+  __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+    const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
+    
+    if (next_block_idx >= num_blocks)
+      return false;
+    
+    // Row-major block assignment
+    m_block_idx = next_block_idx / num_n_blocks;
+    n_block_idx = next_block_idx % num_n_blocks;
+    return true;
+  }
+};
+// ============== End Persistent Scheduler ==============
+
 // ============== Debug Print Utilities ==============
 #ifdef DEBUG_MODE
 
@@ -134,13 +162,14 @@ struct SharedStorage
 constexpr int ProducerRegCount = 40;
 constexpr int ConsumerRegCount = 232;
 
-template <class ProblemShape, class ACtaTiler, class BCtaTiler, class CCtaTiler,
+template <uint32_t kNumSMs,
+          class ProblemShape, class ACtaTiler, class BCtaTiler, class CCtaTiler,
           class TA, class ASmemLayout, class TmaA, class S2RAtomA,
           class TB, class BSmemLayout, class TmaB,
           class TC, class CStride, class TiledMma, class TiledMmaA,
           class Alpha, class Beta>
 __global__ static
-__launch_bounds__(160, 2)  // 5 warps: 1 producer + 4 consumers, target 2 blocks/SM
+__launch_bounds__(160, 1)  // 5 warps: 1 producer + 4 consumers, persistent kernel
 void
 gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler, CCtaTiler c_cta_tiler,
             TA const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a, S2RAtomA s2r_atom_a,
@@ -154,10 +183,6 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   static_assert(is_static<ASmemLayout>::value);
   static_assert(is_static<BSmemLayout>::value);
 
-  //
-  // Full and Tiled Tensors
-  //
-
   // Represent the full tensors
   auto [M, A_K, N, B_K] = shape_MNK;
   auto gA_layout = make_layout(make_shape(M, A_K), make_stride(A_K, Int<1>{}));
@@ -166,11 +191,11 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   Tensor mB = tma_b.get_tma_tensor(gB_layout.shape());              
   Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), dC);
 
-  // Get the appropriate blocks for this thread block
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
-  Tensor gA = local_tile(mA, a_cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, b_cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, c_cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
+  // Persistent scheduler
+  constexpr uint32_t BLOCK_M = size<0>(CCtaTiler{});
+  constexpr uint32_t BLOCK_N = size<1>(CCtaTiler{});
+  PersistentScheduler<BLOCK_M, BLOCK_N, kNumSMs> scheduler(M, N);
+  uint32_t m_block_idx, n_block_idx;
 
   // Shared memory tensors
   extern __shared__ char shared_memory[];
@@ -179,31 +204,11 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), ASmemLayout{}); // (BLK_M,BLK_K,PIPE)
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), BSmemLayout{}); // (BLK_N,BLK_K,PIPE)
 
-  //
-  // Partition the copying of A and B tiles using TMA
-  //
-
-  auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sA), group_modes<0,2>(gA));  // (TMA,k) and (TMA,PIPE)
-
+  // Cluster setup for TMA multicast
   auto cluster_shape = make_shape(Int<2>{}, Int<1>{}, Int<1>{}); 
   Layout cta_layout_mnk = make_layout(cluster_shape);
   auto cta_coord_mnk = cta_layout_mnk.get_flat_coord(cute::block_rank_in_cluster());                                  
   uint16_t mcast_mask_b = create_tma_multicast_mask<0>(cta_layout_mnk, cta_coord_mnk);
-  bool is_elected_for_b = (get<0>(cta_coord_mnk) == 0);
-  auto [tBgB, tBsB] = tma_partition(tma_b, 
-    get<0>(cta_coord_mnk),           // M 方向的 CTA 坐标
-    make_layout(size<0>(cluster_shape)), // M 方向 layout (2)
-    group_modes<0,2>(sB), group_modes<0,2>(gB));
-
-  // The TMA is responsible for copying everything in mode-0 of tAsA and tBsB
-  constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
-                                      + sizeof(make_tensor_like(tensor<0>(tBsB)));
-
-  
-  //
-  // Define A/B partitioning and C accumulators
-  //
 
   // Producer: warp 4 (threads 128-159), Consumer: warps 0-3 (threads 0-127)
   bool is_producer = (threadIdx.x >= 128);
@@ -243,44 +248,18 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
     )
   );
 
-  // Allocate the accumulators -- same size as the projected data
-  Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
-  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
-
-  // Clear the accumulators (only consumers need this)
-  if (is_consumer) {
-    clear(tCrC);
-  }
-
-  // Debug print (only when compiled with -DDEBUG_MODE)
-  DEBUG_PRINT_VAR(gA_layout);
-  DEBUG_PRINT_MATRIX_A(s2r_atom_a, s2r_copy_a, s2r_thr_copy_a, mA, gA, sA, tAgA, tAsA, tCsA, tCrA, tXsA, tXrA);
-  DEBUG_PRINT_MATRIX_B(mB, gB, sB, tBgB, tBsB, tCsB, tCrB);
-  DEBUG_PRINT_VAR(tCrB_reshaped);
-  DEBUG_PRINT_MATRIX_C(mC, gC, tCgC, tCrC);
-  
-#if 1
-  //
-  // PREFETCH
-  //
-
-  auto K_PIPE_MAX = size<1>(tAsA);
-  // Total count of tiles (use A's k-tile count as main loop count)
-  int k_tile_count = size<1>(tAgA);
-  // Current tile index in gmem to read from
-  int k_tile = 0;
-
-  // Initialize Barriers
-  // Producer warp is warp 0, use lane_predicate to elect one thread
+  // Initialize Barriers (done once before persistent loop)
   int lane_predicate = cute::elect_one_sync();
   uint64_t* producer_mbar = smem.tma_barrier;
   uint64_t* consumer_mbar = smem.mma_barrier;
 
   using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;  // TMA
   using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
+  
+  auto K_PIPE_MAX = size<2>(sA);
   CUTE_UNROLL
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
-    // Producer warp (warp 0) initializes barriers
+    // Producer warp initializes barriers
     if (is_producer && lane_predicate) {
       ProducerBarType::init(&producer_mbar[pipe],   1);
       ConsumerBarType::init(&consumer_mbar[pipe], 128);  // 4 consumer warps = 128 threads
@@ -289,52 +268,63 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
   // Ensure barrier init is complete on all CTAs
   cluster_sync();
 
-  // Total number of k-tiles
-  int k_tile_max = size<1>(tAgA);
+  // Persistently schedule over blocks
+  while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+    // Get the appropriate blocks for this iteration
+    auto cta_coord = make_coord(m_block_idx, n_block_idx, _);              // (m,n,k)
+    Tensor gA = local_tile(mA, a_cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(mB, b_cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+    Tensor gC = local_tile(mC, c_cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
 
-  // Start async loads for valid pipes only (producer warp only)
-  CUTE_UNROLL
-  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
-  {
-    if (is_producer && lane_predicate)
-    {
-      if (k_tile < k_tile_max) {
-        // Set expected Tx Bytes and issue TMA
-        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-        copy(tma_b.with(producer_mbar[pipe], mcast_mask_b), tBgB(_,k_tile), tBsB(_,pipe));
-      } else {
-        // No more tiles - expect 0 bytes so barrier completes immediately
-        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
-      }
+    auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
+                                      group_modes<0,2>(sA), group_modes<0,2>(gA));  // (TMA,k) and (TMA,PIPE)
+
+    auto [tBgB, tBsB] = tma_partition(tma_b, 
+      get<0>(cta_coord_mnk),           // M 方向的 CTA 坐标
+      make_layout(size<0>(cluster_shape)), // M 方向 layout (2)
+      group_modes<0,2>(sB), group_modes<0,2>(gB));
+
+    // The TMA is responsible for copying everything in mode-0 of tAsA and tBsB
+    int tma_transaction_bytes = int(sizeof(make_tensor_like(tensor<0>(tAsA))))
+                              + int(sizeof(make_tensor_like(tensor<0>(tBsB))));
+
+    // Allocate the accumulators -- same size as the projected data
+    Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
+    Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
+
+    // Clear the accumulators (only consumers need this)
+    if (is_consumer) {
+      clear(tCrC);
     }
-    --k_tile_count;
-    ++k_tile;
-  }
 
+    // Debug print (only when compiled with -DDEBUG_MODE)
+    DEBUG_PRINT_VAR(gA_layout);
+    DEBUG_PRINT_MATRIX_A(s2r_atom_a, s2r_copy_a, s2r_thr_copy_a, mA, gA, sA, tAgA, tAsA, tCsA, tCrA, tXsA, tXrA);
+    DEBUG_PRINT_MATRIX_B(mB, gB, sB, tBgB, tBsB, tCsB, tCrB);
+    DEBUG_PRINT_VAR(tCrB_reshaped);
+    DEBUG_PRINT_MATRIX_C(mC, gC, tCgC, tCrC);
 
-  //
-  // PIPELINED MAIN LOOP
-  //
+#if 1
+    //
+    // PREFETCH
+    //
 
-  // A PipelineState is a circular pipe index [.index()] and a pipe phase [.phase()]
-  //   that flips each cycle through K_PIPE_MAX.
-  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes (producer)
-  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA reads (consumer)
-  
-  
-  // Producer warp (warp 0) - only does TMA loading
-  if (is_producer) {
-    CUTE_NO_UNROLL
-    while (k_tile_count > -K_PIPE_MAX)
+    // Total count of tiles (use A's k-tile count as main loop count)
+    int k_tile_count = size<1>(tAgA);
+    // Current tile index in gmem to read from
+    int k_tile = 0;
+
+    // Total number of k-tiles
+    int k_tile_max = size<1>(tAgA);
+
+    // Start async loads for valid pipes only (producer warp only)
+    CUTE_UNROLL
+    for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
     {
-      if (lane_predicate)
+      if (is_producer && lane_predicate)
       {
-        int pipe = write_state.index();
-        // Wait for Consumer to complete consumption
-        ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
-        // Set expected Tx Bytes after each reset / init
         if (k_tile < k_tile_max) {
+          // Set expected Tx Bytes and issue TMA
           ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
           copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
           copy(tma_b.with(producer_mbar[pipe], mcast_mask_b), tBgB(_,k_tile), tBsB(_,pipe));
@@ -342,47 +332,95 @@ gemm_device(ProblemShape shape_MNK, ACtaTiler a_cta_tiler, BCtaTiler b_cta_tiler
           // No more tiles - expect 0 bytes so barrier completes immediately
           ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
         }
-        ++write_state;
       }
       --k_tile_count;
       ++k_tile;
     }
-  }
-  // Consumer warps (warps 1-4) - only do WGMMA computation
-  else {
-    CUTE_NO_UNROLL
-    while (k_tile_count > -K_PIPE_MAX)
-    {
-      // Wait for Producer to complete
-      int read_pipe = read_state.index();
-      ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
-      // Copy A from shared memory to registers
-      copy(s2r_copy_a, tXsA(_,_,_,read_pipe), tXrA);
-      // MMAs to cover 1 K_TILE
-      warpgroup_arrive();
-      // warpgroup_fence_operand(tCrC);
-      // warpgroup_fence_operand(tCrA);
-      auto tCrB_k = tCrB_reshaped(_,_,_,read_pipe);
-      cute::gemm(mma, tCrA, tCrB_k, tCrC);     // (V,M) x (V,N) => (V,M,N)
-      warpgroup_commit_batch();
-      // Wait for all MMAs in a K_TILE to complete
-      warpgroup_wait<0>();
-      // warpgroup_fence_operand(tCrC);
-      // Notify that consumption is done
-      ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
-      ++read_state;
 
-      --k_tile_count;
-      ++k_tile;
+
+    //
+    // PIPELINED MAIN LOOP
+    //
+
+    // A PipelineState is a circular pipe index [.index()] and a pipe phase [.phase()]
+    //   that flips each cycle through K_PIPE_MAX.
+    auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes (producer)
+    auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA reads (consumer)
+    
+    // Producer warp (warp 0) - only does TMA loading
+    if (is_producer) {
+      CUTE_NO_UNROLL
+      while (k_tile_count > -K_PIPE_MAX)
+      {
+        if (lane_predicate)
+        {
+          int pipe = write_state.index();
+          // Wait for Consumer to complete consumption
+          ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+          // Set expected Tx Bytes after each reset / init
+          if (k_tile < k_tile_max) {
+            ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+            copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+            copy(tma_b.with(producer_mbar[pipe], mcast_mask_b), tBgB(_,k_tile), tBsB(_,pipe));
+          } else {
+            // No more tiles - expect 0 bytes so barrier completes immediately
+            ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], 0);
+          }
+          ++write_state;
+        }
+        --k_tile_count;
+        ++k_tile;
+      }
     }
-  }
+    // Consumer warps (warps 1-4) - only do WGMMA computation
+    else {
+      CUTE_NO_UNROLL
+      while (k_tile_count > -K_PIPE_MAX)
+      {
+        // Wait for Producer to complete
+        int read_pipe = read_state.index();
+        ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+        // Copy A from shared memory to registers
+        copy(s2r_copy_a, tXsA(_,_,_,read_pipe), tXrA);
+        // MMAs to cover 1 K_TILE
+        warpgroup_arrive();
+        // warpgroup_fence_operand(tCrC);
+        // warpgroup_fence_operand(tCrA);
+        auto tCrB_k = tCrB_reshaped(_,_,_,read_pipe);
+        cute::gemm(mma, tCrA, tCrB_k, tCrC);     // (V,M) x (V,N) => (V,M,N)
+        warpgroup_commit_batch();
+        // Wait for all MMAs in a K_TILE to complete
+        warpgroup_wait<0>();
+        // warpgroup_fence_operand(tCrC);
+        // Notify that consumption is done
+        ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+        ++read_state;
 
-  //
-  // Epilogue (unpredicated)
-  //
+        --k_tile_count;
+        ++k_tile;
+      }
+    }
 
-  // axpby(alpha, tCrC, beta, tCgC);
+    //
+    // Epilogue (unpredicated)
+    //
+
+    // axpby(alpha, tCrC, beta, tCgC);
 #endif
+
+    // Synchronize before next block iteration
+    cluster_sync();
+
+    // Re-initialize barriers for next block
+    CUTE_UNROLL
+    for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+      if (is_producer && lane_predicate) {
+        ProducerBarType::init(&producer_mbar[pipe],   1);
+        ConsumerBarType::init(&consumer_mbar[pipe], 128);
+      }
+    }
+    cluster_sync();
+  }
 }
 
 
@@ -398,6 +436,13 @@ gemm_tn(int m, int n, int a_k, int b_k,
         TC      * C, int ldC,
         cudaStream_t stream = 0)
 {
+  // Get number of SMs for persistent scheduling
+  cudaDeviceProp props;
+  int device_id;
+  cudaGetDevice(&device_id);
+  cudaGetDeviceProperties(&props, device_id);
+  const int num_sms = props.multiProcessorCount;
+
   auto prob_shape = make_shape(m, a_k, n, b_k);
 
   auto a_cta_tiler = make_shape(_64{}, _64{}, _128{}); // M X K
@@ -424,16 +469,18 @@ gemm_tn(int m, int n, int a_k, int b_k,
   TiledMMA tiled_mma_a = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN_A<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
   TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x64_F16I2E4M3_RS_TN<GMMA::ScaleIn::One, GMMA::ScaleIn::One>{});
 
-  // Launch parameter setup
+  // Launch parameter setup for persistent kernel
   // 5 warps: 1 producer (TMA) + 4 consumers (WGMMA)
   dim3 dimBlock(160);
   dim3 dimCluster(2, 1, 1);
-  dim3 dimGrid(round_up(size(ceil_div(m, size<0>(c_cta_tiler))), dimCluster.x),
-               round_up(size(ceil_div(n, size<1>(c_cta_tiler))), dimCluster.y));
+  // Persistent kernel: launch exactly num_sms blocks (rounded up for cluster)
+  constexpr uint32_t kNumSMs = 132;  // H100 has 132 SMs, adjust as needed
+  dim3 dimGrid(round_up(kNumSMs, dimCluster.x), 1, 1);
   cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_size};
 
   void const* kernel_ptr = reinterpret_cast<void const*>(
-                              &gemm_device<decltype(prob_shape), decltype(a_cta_tiler), decltype(b_cta_tiler), decltype(c_cta_tiler),
+                              &gemm_device<kNumSMs,
+                                           decltype(prob_shape), decltype(a_cta_tiler), decltype(b_cta_tiler), decltype(c_cta_tiler),
                                            TA, decltype(sA), decltype(tmaA), decltype(s2r_atom_a),
                                            TB, decltype(sB), decltype(tmaB),
                                            TC, decltype(dC), decltype(tiled_mma), decltype(tiled_mma_a),
